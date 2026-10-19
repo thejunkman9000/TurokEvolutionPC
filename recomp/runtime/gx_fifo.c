@@ -6,6 +6,8 @@
 // only commands with side effects are the pixel-engine draw-done/token BP
 // writes, which raise PE interrupts (GXDrawDone / GXSetDrawSync waits on them).
 // This is the front end the renderer will hang off.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <stdio.h>
 #include "ppc.h"
 #include "host.h"
@@ -134,7 +136,7 @@ static uint32_t parse_one_inner(const uint8_t *p, uint32_t n, int in_dl) {
 static uint8_t s_fifo[1 << 20];
 static uint32_t s_len;
 
-static void cp_feed(const uint8_t *data, uint32_t n) {
+static void cp_parse(const uint8_t *data, uint32_t n) {
     if (s_len + n > sizeof s_fifo) fatal("GX FIFO overflow (stuck command?)");
     memcpy(s_fifo + s_len, data, n);
     s_len += n;
@@ -146,6 +148,82 @@ static void cp_feed(const uint8_t *data, uint32_t n) {
     }
     if (pos) { memmove(s_fifo, s_fifo + pos, s_len - pos); s_len -= pos; }
 }
+
+// ---- GPU thread ---------------------------------------------------------------------------
+// Like the real GPU, the command processor runs asynchronously: the guest only
+// copies the bytes the CP reads into a ring, and a separate thread parses them
+// and runs the vertex pipeline (gx_render.c). Everything behind cp_parse
+// (CP/XF/BP state, frame building, the texture cache) is touched only by that
+// thread. The game synchronises with the GPU the way it must on hardware: draw
+// sync tokens and draw-done raise PE interrupts when the thread reaches them.
+// Commands read guest RAM (display lists, vertex arrays, textures) when they
+// are parsed, as the GPU does. TUROK_GX_THREAD=0 parses on the guest thread.
+#pragma comment(lib, "synchronization.lib")
+#define RING_SIZE (8u << 20)  // a few frames of commands; the guest stalls when it is full
+static uint8_t *s_ring;
+static volatile uint64_t s_ring_head, s_ring_tail;  // bytes written by the guest / parsed by the GPU thread
+static volatile LONG s_gpu_sleeping;
+static int s_threaded = -1;
+volatile uint64_t g_gpu_busy_tsc;  // time the GPU thread spends parsing ([stats])
+
+static DWORD WINAPI gpu_thread(LPVOID arg) {
+    (void)arg;
+    uint64_t tail = s_ring_tail;
+    for (;;) {
+        uint64_t head = s_ring_head;
+        if (head == tail) {
+            // spin briefly (the guest usually sends more within microseconds), then sleep
+            for (int i = 0; i < 4000 && s_ring_head == tail; i++) _mm_pause();
+            if (s_ring_head == tail) {
+                InterlockedExchange(&s_gpu_sleeping, 1);
+                uint64_t seen = tail;
+                if (s_ring_head == tail) WaitOnAddress(&s_ring_head, &seen, sizeof seen, INFINITE);
+                InterlockedExchange(&s_gpu_sleeping, 0);
+            }
+            continue;
+        }
+        _ReadWriteBarrier();
+        // parse in contiguous pieces of at most 64 KB so the tail advances steadily
+        uint32_t off = (uint32_t)(tail % RING_SIZE), n = (uint32_t)(head - tail);
+        if (n > RING_SIZE - off) n = RING_SIZE - off;
+        if (n > 65536) n = 65536;
+        uint64_t t0 = __rdtsc();
+        cp_parse(s_ring + off, n);
+        g_gpu_busy_tsc += __rdtsc() - t0;
+        tail += n;
+        _ReadWriteBarrier();
+        s_ring_tail = tail;
+    }
+}
+
+static void cp_feed(const uint8_t *data, uint32_t n) {
+    if (s_threaded < 0) {
+        const char *e = getenv("TUROK_GX_THREAD");
+        s_threaded = !(e && e[0] == '0');
+        if (s_threaded) {
+            s_ring = malloc(RING_SIZE);
+            CreateThread(NULL, 0, gpu_thread, NULL, 0, NULL);
+        }
+    }
+    if (!s_threaded) { cp_parse(data, n); return; }
+    while (n) {
+        uint64_t head = s_ring_head;
+        while (head - s_ring_tail + 32 > RING_SIZE) SwitchToThread();  // GPU behind: wait for room
+        uint32_t off = (uint32_t)(head % RING_SIZE), k = RING_SIZE - off;
+        if (k > n) k = n;
+        uint64_t room = RING_SIZE - (head - s_ring_tail);
+        if (k > room) k = (uint32_t)room;
+        memcpy(s_ring + off, data, k);
+        _ReadWriteBarrier();
+        s_ring_head = head + k;
+        data += k; n -= k;
+    }
+    MemoryBarrier();
+    if (s_gpu_sleeping) WakeByAddressSingle((PVOID)&s_ring_head);
+}
+
+// CP status register: the GP reports idle once it has parsed everything.
+int gx_fifo_idle(void) { return !s_threaded || s_ring_tail == s_ring_head; }
 
 // ---- write-gather pipe -> PI FIFO in RAM -> CP ---------------------------------------
 // CPU writes to 0xCC008000 are gathered into 32-byte bursts and written to RAM
@@ -173,8 +251,9 @@ static void cp_run(void) {
     uint32_t w = cp32(CP_WPTR) & 0x03FFFFE0u, r = cp32(CP_RPTR) & 0x03FFFFE0u;
     if (end <= base || r < base || r >= end + 32) { cp32_set(CP_RPTR, w); return; }
     for (uint32_t guard = 0; r != w && guard < (1u << 20); guard++) {
-        cp_feed(g_ram + (r & 0x01FFFFFF), 32);
-        r += 32;
+        uint32_t stop = w > r ? w : end;  // contiguous up to the write pointer or the wrap
+        cp_feed(g_ram + (r & 0x01FFFFFF), stop - r);
+        r = stop;
         if (r >= end) r = base;
     }
     cp32_set(CP_RPTR, r);
@@ -188,7 +267,9 @@ static void gather_flush(void) {
     uint32_t base = shadow_read(PI_BASE, 4) & 0x03FFFFE0u, end = shadow_read(PI_END, 4) & 0x03FFFFE0u;
     uint32_t wraw = shadow_read(PI_WPTR, 4), w = wraw & 0x03FFFFE0u;
     if (w + 32 <= RAM_SIZE) memcpy(g_ram + w, s_gather, 32);
-    if (!(shadow_read(CP_CTRL, 2) & 0x10) && getenv("TUROK_LOG_REDIRECT")) {
+    static int s_log_redirect = -1;  // getenv is far too slow for every burst
+    if (s_log_redirect < 0) s_log_redirect = getenv("TUROK_LOG_REDIRECT") != NULL;
+    if (!(shadow_read(CP_CTRL, 2) & 0x10) && s_log_redirect) {
         static int budget = 40;
         if (budget > 0) {
             budget--;
@@ -214,6 +295,10 @@ static void gather_flush(void) {
 void gx_gather_reset(void) { s_gather_len = 0; }
 
 void gx_fifo_write(uint32_t v, int size) {
+    if (s_gather_len + size < 32) {  // common case: the burst doesn't fill up
+        for (int i = size - 1; i >= 0; i--) s_gather[s_gather_len++] = (uint8_t)(v >> (8 * i));
+        return;
+    }
     for (int i = size - 1; i >= 0; i--) {
         s_gather[s_gather_len++] = (uint8_t)(v >> (8 * i));
         if (s_gather_len == 32) gather_flush();

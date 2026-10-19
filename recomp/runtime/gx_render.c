@@ -1,7 +1,8 @@
 // GX state tracking and the vertex pipeline: turns the parsed command stream
 // into CoreFrame batches for the host renderer.
 //
-// Per draw, on the CPU:
+// Runs on the GPU thread (gx_fifo.c); lighting and texgen go to worker threads
+// ("vertex jobs"). Per draw, on the CPU:
 //   * vertices are decoded (direct or indexed attributes) and transformed to
 //     view space with the position matrix
 //   * both colour channels are lit exactly like the XF unit (gx_light)
@@ -31,6 +32,8 @@ static float xf_mem[0x700];       // pos/tex mtx 0x000-0x0FF, normal 0x400-0x45F
 static uint32_t xf_reg[0x60];     // registers 0x1000..0x105F
 static uint32_t bp[0x100];
 static uint8_t s_tmem_tlut[0x80000];  // upper TMEM half (TLUTs), 512 KB
+static int s_state_dirty = 1;         // BP / viewport changed since the last draw's state capture
+static int s_xf_dirty = 1;            // XF / matrix indices changed since the last draw's XF snapshot
 
 #define XF_NUMCHAN   0x09
 #define XF_AMBIENT0  0x0A
@@ -48,8 +51,8 @@ static uint8_t s_tmem_tlut[0x80000];  // upper TMEM half (TLUTs), 512 KB
 
 void gx_cp_write(uint8_t reg, uint32_t v) {
     switch (reg & 0xF0) {
-    case 0x30: cp_matidx_a = v; break;
-    case 0x40: cp_matidx_b = v; break;
+    case 0x30: cp_matidx_a = v; s_xf_dirty = 1; break;
+    case 0x40: cp_matidx_b = v; s_xf_dirty = 1; break;
     case 0x50: cp_vcd_lo = v; break;
     case 0x60: cp_vcd_hi = v; break;
     case 0x70: cp_vat_a[reg & 7] = v; break;
@@ -67,9 +70,11 @@ uint32_t gx_cp_vat(int which, int fmt) {
 }
 
 static void xf_store(uint32_t addr, uint32_t v) {
+    s_xf_dirty = 1;
     if (addr < 0x700) { memcpy(&xf_mem[addr], &v, 4); return; }
     if (addr >= 0x1000 && addr < 0x1060) {
         xf_reg[addr - 0x1000] = v;
+        if (addr >= 0x1000 + XF_VIEWPORT && addr < 0x1000 + XF_VIEWPORT + 6) s_state_dirty = 1;  // fog uses viewport z
         if (addr == 0x1018) cp_matidx_a = v;   // XF copies of the matrix indices
         if (addr == 0x1019) cp_matidx_b = v;
     }
@@ -157,23 +162,35 @@ static uint32_t frame_material(const CoreMaterial *m) {
 void gx_texture_end_frame(void);
 
 // ---- statistics (logged once per second of guest time) -----------------------------------
-static struct { uint32_t frames, draws, lines, points, ind_draws, zcopies, tri_verts; } s_st;
-static uint64_t s_st_start;
+// busy = wall time minus the guest's VIWaitForRetrace waits (hle.c); gpu = time the
+// GPU thread spends parsing commands (gx_fifo.c), of which draw = time in gx_draw;
+// xf = vertex transform time summed over all threads (vertex jobs).
+static struct { uint32_t frames, draws, lines, points, ind_draws, zcopies, tri_verts; uint64_t draw_tsc; } s_st;
+static uint64_t s_st_start, s_st_tsc0, s_st_idle0, s_st_gpu0, s_st_xf0, s_st_gpu_frame0, s_st_gpu_max;
+extern volatile uint64_t g_perf_idle_tsc, g_perf_max_busy_tsc, g_gpu_busy_tsc, g_xf_tsc;
 static void stats_frame(void) {
     s_st.frames++;
-    uint64_t now = host_time_ticks();
-    if (!s_st_start) s_st_start = now;
+    uint64_t now = host_time_ticks(), tsc = __rdtsc(), gpu = g_gpu_busy_tsc;
+    if (gpu - s_st_gpu_frame0 > s_st_gpu_max) s_st_gpu_max = gpu - s_st_gpu_frame0;
+    s_st_gpu_frame0 = gpu;
+    if (!s_st_start) { s_st_start = now; s_st_tsc0 = tsc; s_st_idle0 = g_perf_idle_tsc; s_st_gpu0 = g_gpu_busy_tsc; s_st_xf0 = g_xf_tsc; }
     if (now - s_st_start >= TB_FREQ) {
         double secs = (double)(now - s_st_start) / TB_FREQ;
-        logf_("[stats] %.1f fps | per frame: %u draws, %u verts | lines %u points %u indirect %u zcopies %u (per s)",
+        double ms_per_tsc = secs * 1000.0 / (double)(tsc - s_st_tsc0), nf = s_st.frames ? s_st.frames : 1;
+        double busy = (double)(tsc - s_st_tsc0 - (g_perf_idle_tsc - s_st_idle0)) * ms_per_tsc / nf;
+        logf_("[stats] %.1f fps | per frame: %u draws, %u verts, busy %.1f ms (max %.1f), gpu %.1f ms (max %.1f), draw %.1f ms, xf %.1f ms | lines %u points %u indirect %u zcopies %u (per s)",
               s_st.frames / secs, s_st.frames ? s_st.draws / s_st.frames : 0, s_st.frames ? s_st.tri_verts / s_st.frames : 0,
-              s_st.lines, s_st.points, s_st.ind_draws, s_st.zcopies);
+              busy, (double)g_perf_max_busy_tsc * ms_per_tsc, (double)(g_gpu_busy_tsc - s_st_gpu0) * ms_per_tsc / nf, (double)s_st_gpu_max * ms_per_tsc, (double)s_st.draw_tsc * ms_per_tsc / nf, (double)(g_xf_tsc - s_st_xf0) * ms_per_tsc / nf, s_st.lines, s_st.points, s_st.ind_draws, s_st.zcopies);
         memset(&s_st, 0, sizeof s_st);
-        s_st_start = now;
+        s_st_start = now; s_st_tsc0 = tsc; s_st_idle0 = g_perf_idle_tsc; s_st_gpu0 = g_gpu_busy_tsc; s_st_xf0 = g_xf_tsc;
+        g_perf_max_busy_tsc = 0; s_st_gpu_max = 0;
     }
 }
 
+static void jobs_drain(void);
+static void arena_reset(void);
 static void publish_frame(void) {
+    jobs_drain();  // every vertex of the frame is written
     stats_frame();
     FrameSlot *f = s_build;
     f->f.serial = ++s_serial;
@@ -189,6 +206,9 @@ static void publish_frame(void) {
     LeaveCriticalSection(&s_frame_lock);
     slot_reset(s_build);
     gx_texture_end_frame();
+    s_state_dirty = 1;  // new frame: material/texture indices start over
+    s_xf_dirty = 1;     // and the snapshots go with the arena
+    arena_reset();
 }
 
 // ---- EFB -> texture copy ---------------------------------------------------------------
@@ -237,6 +257,7 @@ static void efb_copy_to_texture(uint32_t v) {
 // ---- BP ---------------------------------------------------------------------------------
 void gx_bp_write(uint32_t v) {
     uint8_t reg = v >> 24;
+    s_state_dirty = 1;
     uint32_t mask = bp[0xFE] ? bp[0xFE] : 0xFFFFFF;
     if (reg != 0xFE) bp[0xFE] = 0;
     bp[reg] = (bp[reg] & ~mask) | (v & mask);
@@ -278,17 +299,6 @@ typedef struct {
     int pnmtx, tmtx[8];
 } RawVtx;
 
-static float read_comp(const uint8_t *p, int fmt, int shift, int *adv) {
-    float scale = 1.0f / (float)(1u << (shift & 31));
-    switch (fmt) {
-    case 0: *adv = 1; return p[0] * scale;
-    case 1: *adv = 1; return (int8_t)p[0] * scale;
-    case 2: *adv = 2; return (uint16_t)(p[0] << 8 | p[1]) * scale;
-    case 3: *adv = 2; return (int16_t)(p[0] << 8 | p[1]) * scale;
-    default: { *adv = 4; uint32_t u = (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; return u2f(u); }
-    }
-}
-
 static uint32_t read_color(const uint8_t *p, int fmt, int *adv) {
     uint32_t r, g, b, a = 255;
     switch (fmt) {
@@ -317,67 +327,172 @@ static const uint8_t *attr_ptr(int mode, int array, const uint8_t **pp, int dire
 static int comp_size(int fmt) { static const int s[8] = {1, 1, 2, 2, 4, 4, 4, 4}; return s[fmt & 7]; }
 static int color_size(int fmt) { static const int s[8] = {2, 3, 4, 2, 3, 4, 4, 4}; return s[fmt & 7]; }
 
-static void decode_vertex(const uint8_t **pp, int vat, RawVtx *out) {
+// ---- per-draw setup ---------------------------------------------------------------------
+// The vertex format (VCD/VAT) is decoded once per draw instead of once per vertex.
+// Everything the transform reads from XF (matrices, lights, channel and texgen
+// controls) is copied into a per-draw snapshot, so the transform can run later on
+// a worker thread while the GPU thread goes on parsing (see "vertex jobs").
+typedef struct {
+    uint32_t lo;
+    int pnmtx, tmtx[8];                    // matrix indices when not sent per vertex
+    int pmode, pcnt, pfmt, psize; float pscale;
+    int nmode, nfmt, nbt, idx3; float nscale;
+    int cmode[2], cfmt[2], csize[2];
+    int tmode[8], tn[8], tfmt[8], tsize[8]; float tscale[8];
+} VtxFormat;
+static VtxFormat s_vf;
+
+typedef struct {
+    int nchan, ngen, dual;
+    uint32_t cctl[2], actl[2];             // XF colour / alpha channel controls
+    uint32_t tginfo[8], ptinfo[8];         // XF texgen / dual-transform controls
+    float matreg[2][4], ambreg[2][4];
+    float lcol[8][4];                      // light colours, unpacked
+    float light[8][16];                    // XF light parameters (lights some channel uses)
+    float post[8][12];                     // dual-transform post matrix per texgen
+    // Position / normal / texture matrices. With no per-vertex matrix indices every
+    // vertex uses the same ones (pm, nm, tm); otherwise mtx/nrm hold the whole regions.
+    float pm[12], nm[9], tm[8][12];
+    const float *mtx, *nrm;
+} XfSnap;
+
+static float comp_scale(int shift) { return 1.0f / (float)(1u << (shift & 31)); }
+
+static void unpack_rgba(uint32_t c, float o[4]) {  // XF registers: R in the high byte
+    o[0] = (c >> 24) / 255.0f; o[1] = ((c >> 16) & 0xFF) / 255.0f; o[2] = ((c >> 8) & 0xFF) / 255.0f; o[3] = (c & 0xFF) / 255.0f;
+}
+
+static void vtx_format_setup(int vat) {
+    VtxFormat *d = &s_vf;
     uint32_t lo = cp_vcd_lo, hi = cp_vcd_hi, a = cp_vat_a[vat], b = cp_vat_b[vat], c = cp_vat_c[vat];
+    d->lo = lo;
+    d->pnmtx = cp_matidx_a & 63;
+    for (int t = 0; t < 8; t++)
+        d->tmtx[t] = t < 4 ? (cp_matidx_a >> (6 + 6 * t)) & 63 : (cp_matidx_b >> (6 * (t - 4))) & 63;
+    d->pmode = (lo >> 9) & 3; d->pcnt = (a & 1) ? 3 : 2; d->pfmt = (a >> 1) & 7;
+    d->psize = d->pcnt * comp_size(d->pfmt); d->pscale = comp_scale((a >> 4) & 31);
+    // normal (fixed fraction bits: s8 -> 6, s16 -> 14). NBT: keep N only.
+    d->nmode = (lo >> 11) & 3; d->nbt = (a >> 9) & 1; d->idx3 = (a >> 31) & 1; d->nfmt = (a >> 10) & 7;
+    d->nscale = comp_scale(d->nfmt == 1 ? 6 : d->nfmt == 3 ? 14 : 0);
+    for (int ci = 0; ci < 2; ci++) {
+        d->cmode[ci] = (lo >> (13 + 2 * ci)) & 3;
+        d->cfmt[ci] = (a >> (14 + 4 * ci)) & 7;
+        d->csize[ci] = color_size(d->cfmt[ci]);
+    }
+    int tcnt[8] = {(a >> 21) & 1, b & 1, (b >> 9) & 1, (b >> 18) & 1, (b >> 27) & 1, (c >> 5) & 1, (c >> 14) & 1, (c >> 23) & 1};
+    int tfmt[8] = {(a >> 22) & 7, (b >> 1) & 7, (b >> 10) & 7, (b >> 19) & 7, (b >> 28) & 7, (c >> 6) & 7, (c >> 15) & 7, (c >> 24) & 7};
+    int tsh[8] = {(a >> 25) & 31, (b >> 4) & 31, (b >> 13) & 31, (b >> 22) & 31, c & 31, (c >> 9) & 31, (c >> 18) & 31, (c >> 27) & 31};
+    for (int t = 0; t < 8; t++) {
+        d->tmode[t] = (hi >> (2 * t)) & 3;
+        d->tn[t] = tcnt[t] ? 2 : 1;
+        d->tfmt[t] = tfmt[t];
+        d->tsize[t] = d->tn[t] * comp_size(tfmt[t]);
+        d->tscale[t] = comp_scale(tsh[t]);
+    }
+}
+
+static void *arena_alloc(size_t n);
+
+// Copy what transform() needs out of the XF state. Must follow vtx_format_setup.
+static void xf_snapshot(XfSnap *x) {
+    x->nchan = xf_reg[XF_NUMCHAN] & 3;
+    x->ngen = xf_reg[XF_NUMTEXGEN] & 15;
+    x->dual = xf_reg[XF_DUALTEX] & 1;
+    uint32_t lights = 0;
+    for (int ch = 0; ch < 2; ch++) {
+        x->cctl[ch] = xf_reg[XF_COLOR0CTL + ch];
+        x->actl[ch] = xf_reg[XF_ALPHA0CTL + ch];
+        unpack_rgba(xf_reg[XF_MATERIAL0 + ch], x->matreg[ch]);
+        unpack_rgba(xf_reg[XF_AMBIENT0 + ch], x->ambreg[ch]);
+        if (ch < x->nchan)
+            for (int pass = 0; pass < 2; pass++) {
+                uint32_t ctl = pass ? x->actl[ch] : x->cctl[ch];
+                if (ctl & 2) lights |= ((ctl >> 2) & 15) | ((ctl >> 11) & 15) << 4;
+            }
+    }
+    for (int i = 0; i < 8; i++)
+        if (lights & (1u << i)) {
+            unpack_rgba(xf_u32(0x600 + i * 0x10 + 3), x->lcol[i]);
+            memcpy(x->light[i], &xf_mem[0x600 + i * 0x10], sizeof x->light[i]);
+        }
+    int ngen = x->ngen < 8 ? x->ngen : 8;
+    for (int g = 0; g < ngen; g++) {
+        x->tginfo[g] = xf_reg[XF_TEXGEN0 + g];
+        x->ptinfo[g] = xf_reg[XF_POSTTEX0 + g];
+        if (x->dual && ((x->tginfo[g] >> 4) & 7) == 0) memcpy(x->post[g], &xf_mem[0x500 + (x->ptinfo[g] & 63) * 4], sizeof x->post[g]);
+    }
+    if (s_vf.lo & 0x1FF) {  // per-vertex matrix indices: keep whole regions (rare)
+        float *m = arena_alloc((0x10C + 0x68) * sizeof(float));
+        memcpy(m, xf_mem, 0x10C * sizeof(float));                 // 64 matrices of 4-float rows (+ overhang)
+        memcpy(m + 0x10C, &xf_mem[0x400], 0x68 * sizeof(float));  // normal matrices (+ overhang)
+        x->mtx = m; x->nrm = m + 0x10C;
+    } else {
+        x->mtx = x->nrm = NULL;
+        memcpy(x->pm, &xf_mem[s_vf.pnmtx * 4], sizeof x->pm);
+        memcpy(x->nm, &xf_mem[0x400 + (s_vf.pnmtx & 31) * 3], sizeof x->nm);
+        for (int g = 0; g < ngen; g++) memcpy(x->tm[g], &xf_mem[s_vf.tmtx[g] * 4], sizeof x->tm[g]);
+    }
+}
+
+static FORCEINLINE float read_comp(const uint8_t *p, int fmt, float scale, int *adv) {  // scale: 1 / 2^frac bits
+    switch (fmt) {
+    case 0: *adv = 1; return p[0] * scale;
+    case 1: *adv = 1; return (int8_t)p[0] * scale;
+    case 2: *adv = 2; return (uint16_t)(p[0] << 8 | p[1]) * scale;
+    case 3: *adv = 2; return (int16_t)(p[0] << 8 | p[1]) * scale;
+    default: { *adv = 4; uint32_t u = (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; return u2f(u); }
+    }
+}
+
+static void decode_vertex(const uint8_t **pp, RawVtx *out) {
+    const VtxFormat *d = &s_vf;
+    uint32_t lo = d->lo;
     const uint8_t *p = *pp;
     int adv;
-    out->pnmtx = cp_matidx_a & 63;
-    for (int t = 0; t < 8; t++)
-        out->tmtx[t] = t < 4 ? (cp_matidx_a >> (6 + 6 * t)) & 63 : (cp_matidx_b >> (6 * (t - 4))) & 63;
-    if (lo & 1) out->pnmtx = *p++;
-    for (int t = 0; t < 8; t++) if (lo & (2u << t)) out->tmtx[t] = *p++;
+    out->pnmtx = d->pnmtx;
+    for (int t = 0; t < 8; t++) out->tmtx[t] = d->tmtx[t];
+    if (lo & 0x1FF) {
+        if (lo & 1) out->pnmtx = *p++;
+        for (int t = 0; t < 8; t++) if (lo & (2u << t)) out->tmtx[t] = *p++;
+    }
 
     // position
-    int pcnt = (a & 1) ? 3 : 2, pfmt = (a >> 1) & 7, pshift = (a >> 4) & 31;
-    const uint8_t *q = attr_ptr((lo >> 9) & 3, 0, &p, pcnt * comp_size(pfmt));
+    const uint8_t *q = attr_ptr(d->pmode, 0, &p, d->psize);
     out->pos[2] = 0;
-    for (int i = 0; i < pcnt; i++) { out->pos[i] = read_comp(q, pfmt, pshift, &adv); q += adv; }
+    for (int i = 0; i < d->pcnt; i++) { out->pos[i] = read_comp(q, d->pfmt, d->pscale, &adv); q += adv; }
 
-    // normal (fixed fraction bits: s8 -> 6, s16 -> 14). NBT: keep N only.
-    int nmode = (lo >> 11) & 3;
-    out->has_nrm = nmode != 0;
-    if (nmode) {
-        int nbt = (a >> 9) & 1, idx3 = (a >> 31) & 1, nfmt = (a >> 10) & 7;
-        int nshift = nfmt == 1 ? 6 : nfmt == 3 ? 14 : 0;
-        if (nmode == 1) {
-            for (int i = 0; i < 3; i++) { out->nrm[i] = read_comp(p, nfmt, nshift, &adv); p += adv; }
-            if (nbt) p += 6 * comp_size(nfmt);
+    // normal
+    out->has_nrm = d->nmode != 0;
+    if (d->nmode) {
+        if (d->nmode == 1) {
+            for (int i = 0; i < 3; i++) { out->nrm[i] = read_comp(p, d->nfmt, d->nscale, &adv); p += adv; }
+            if (d->nbt) p += 6 * comp_size(d->nfmt);
         } else {
-            q = attr_ptr(nmode, 1, &p, 0);
-            for (int i = 0; i < 3; i++) { out->nrm[i] = read_comp(q, nfmt, nshift, &adv); q += adv; }
-            if (nbt && idx3) p += 2 * (nmode == 2 ? 1 : 2);
+            q = attr_ptr(d->nmode, 1, &p, 0);
+            for (int i = 0; i < 3; i++) { out->nrm[i] = read_comp(q, d->nfmt, d->nscale, &adv); q += adv; }
+            if (d->nbt && d->idx3) p += 2 * (d->nmode == 2 ? 1 : 2);
         }
     }
 
     // colours
     for (int ci = 0; ci < 2; ci++) {
-        int mode = (lo >> (13 + 2 * ci)) & 3;
-        out->has_color[ci] = mode != 0;
-        if (!mode) continue;
-        int fmt = (a >> (14 + 4 * ci)) & 7;
-        q = attr_ptr(mode, 2 + ci, &p, color_size(fmt));
-        out->color[ci] = read_color(q, fmt, &adv);
+        out->has_color[ci] = d->cmode[ci] != 0;
+        if (!d->cmode[ci]) continue;
+        q = attr_ptr(d->cmode[ci], 2 + ci, &p, d->csize[ci]);
+        out->color[ci] = read_color(q, d->cfmt[ci], &adv);
     }
 
     // texture coordinates
-    int tcnt[8] = {(a >> 21) & 1, b & 1, (b >> 9) & 1, (b >> 18) & 1, (b >> 27) & 1, (c >> 5) & 1, (c >> 14) & 1, (c >> 23) & 1};
-    int tfmt[8] = {(a >> 22) & 7, (b >> 1) & 7, (b >> 10) & 7, (b >> 19) & 7, (b >> 28) & 7, (c >> 6) & 7, (c >> 15) & 7, (c >> 24) & 7};
-    int tsh[8] = {(a >> 25) & 31, (b >> 4) & 31, (b >> 13) & 31, (b >> 22) & 31, c & 31, (c >> 9) & 31, (c >> 18) & 31, (c >> 27) & 31};
     for (int t = 0; t < 8; t++) {
         out->st[t][0] = out->st[t][1] = 0;
-        int mode = (hi >> (2 * t)) & 3;
-        if (!mode) continue;
-        int n = tcnt[t] ? 2 : 1;
-        q = attr_ptr(mode, 4 + t, &p, n * comp_size(tfmt[t]));
-        for (int i = 0; i < n; i++) { out->st[t][i] = read_comp(q, tfmt[t], tsh[t], &adv); q += adv; }
+        if (!d->tmode[t]) continue;
+        q = attr_ptr(d->tmode[t], 4 + t, &p, d->tsize[t]);
+        for (int i = 0; i < d->tn[t]; i++) { out->st[t][i] = read_comp(q, d->tfmt[t], d->tscale[t], &adv); q += adv; }
     }
     *pp = p;
 }
 
 // ---- lighting (XF colour channels) -------------------------------------------------------
-static void unpack_rgba(uint32_t c, float o[4]) {  // XF registers: R in the high byte
-    o[0] = (c >> 24) / 255.0f; o[1] = ((c >> 16) & 0xFF) / 255.0f; o[2] = ((c >> 8) & 0xFF) / 255.0f; o[3] = (c & 0xFF) / 255.0f;
-}
 static void unpack_vtx(uint32_t c, float o[4]) {   // decoded vertex colour: R in the low byte
     o[0] = (c & 0xFF) / 255.0f; o[1] = ((c >> 8) & 0xFF) / 255.0f; o[2] = ((c >> 16) & 0xFF) / 255.0f; o[3] = (c >> 24) / 255.0f;
 }
@@ -385,15 +500,14 @@ static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 static float dot3(const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 
 // Accumulate the lights selected by a channel control word into lacc[comp0..comp1).
-static void accumulate_lights(uint32_t ctl, const float pos[3], const float n[3], float lacc[4], int c0, int c1) {
+static void accumulate_lights(const XfSnap *x, uint32_t ctl, const float pos[3], const float n[3], float lacc[4], int c0, int c1) {
     uint32_t mask = ((ctl >> 2) & 15) | ((ctl >> 11) & 15) << 4;
     int diffuse = (ctl >> 7) & 3, attnf = (ctl >> 9) & 3;
     for (int i = 0; i < 8; i++) {
         if (!(mask & (1u << i))) continue;
-        uint32_t base = 0x600 + i * 0x10;
-        float col[4]; unpack_rgba(xf_u32(base + 3), col);
-        const float *cosatt = &xf_mem[base + 4], *distatt = &xf_mem[base + 7];
-        const float *lpos = &xf_mem[base + 10], *ldirv = &xf_mem[base + 13];
+        const float *col = x->lcol[i], *lt = x->light[i];
+        const float *cosatt = &lt[4], *distatt = &lt[7];
+        const float *lpos = &lt[10], *ldirv = &lt[13];
         float ldir[3] = {lpos[0] - pos[0], lpos[1] - pos[1], lpos[2] - pos[2]};
         float attn = 1.0f;
         if (attnf == 3) {  // spot
@@ -421,14 +535,12 @@ static void accumulate_lights(uint32_t ctl, const float pos[3], const float n[3]
     }
 }
 
-static uint32_t light_channel(int chan, const RawVtx *r, const float pos[3], const float n[3]) {
-    uint32_t cctl = xf_reg[XF_COLOR0CTL + chan], actl = xf_reg[XF_ALPHA0CTL + chan];
+static uint32_t light_channel(const XfSnap *x, int chan, const RawVtx *r, const float pos[3], const float n[3]) {
+    uint32_t cctl = x->cctl[chan], actl = x->actl[chan];
     float vtx[4] = {1, 1, 1, 1};
     if (r->has_color[chan]) unpack_vtx(r->color[chan], vtx);
     else if (chan == 1 && r->has_color[0]) unpack_vtx(r->color[0], vtx);
-    float matreg[4], ambreg[4];
-    unpack_rgba(xf_reg[XF_MATERIAL0 + chan], matreg);
-    unpack_rgba(xf_reg[XF_AMBIENT0 + chan], ambreg);
+    const float *matreg = x->matreg[chan], *ambreg = x->ambreg[chan];
     float out[4];
     for (int pass = 0; pass < 2; pass++) {  // pass 0: rgb (colour ctl), pass 1: alpha (alpha ctl)
         uint32_t ctl = pass ? actl : cctl;
@@ -437,7 +549,7 @@ static uint32_t light_channel(int chan, const RawVtx *r, const float pos[3], con
         if (!(ctl & 2)) { for (int k = c0; k < c1; k++) out[k] = mat[k]; continue; }
         const float *amb = (ctl & 0x40) ? vtx : ambreg;
         float lacc[4] = {amb[0], amb[1], amb[2], amb[3]};
-        accumulate_lights(ctl, pos, n, lacc, c0, c1);
+        accumulate_lights(x, ctl, pos, n, lacc, c0, c1);
         for (int k = c0; k < c1; k++) out[k] = mat[k] * clamp01(lacc[k]);
     }
     uint32_t res = 0;
@@ -446,14 +558,13 @@ static uint32_t light_channel(int chan, const RawVtx *r, const float pos[3], con
 }
 
 // ---- texgen ---------------------------------------------------------------------------------
-static void texgen(const RawVtx *r, const float nmodel[3], uint32_t c0, CoreVertex *o) {
-    int ngen = xf_reg[XF_NUMTEXGEN] & 15;
-    int dual = xf_reg[XF_DUALTEX] & 1;
+static void texgen(const XfSnap *x, const RawVtx *r, const float nmodel[3], uint32_t c0, CoreVertex *o) {
+    int ngen = x->ngen < 8 ? x->ngen : 8;
+    int dual = x->dual;
     float outs[8][3];
-    for (int g = 0; g < 8; g++) {
-        o->uv[g][0] = o->uv[g][1] = 0;
-        if (g >= ngen) continue;
-        uint32_t info = xf_reg[XF_TEXGEN0 + g];
+    memset(o->uv, 0, sizeof o->uv);
+    for (int g = 0; g < ngen; g++) {
+        uint32_t info = x->tginfo[g];
         int proj = (info >> 1) & 1, abc1 = (info >> 2) & 1, type = (info >> 4) & 7, src = (info >> 7) & 31;
         float in[4] = {0, 0, 1, 1};
         switch (src) {
@@ -467,7 +578,7 @@ static void texgen(const RawVtx *r, const float nmodel[3], uint32_t c0, CoreVert
         if (!abc1 && src >= 5) in[2] = 1.0f;
         float s, t, q = 1.0f;
         if (type == 0) {  // regular: texture matrix
-            const float *m = &xf_mem[(r->tmtx[g] & 63) * 4];
+            const float *m = x->mtx ? x->mtx + (r->tmtx[g] & 63) * 4 : x->tm[g];
             s = m[0] * in[0] + m[1] * in[1] + m[2] * in[2] + m[3] * in[3];
             t = m[4] * in[0] + m[5] * in[1] + m[6] * in[2] + m[7] * in[3];
             if (proj) q = m[8] * in[0] + m[9] * in[1] + m[10] * in[2] + m[11] * in[3];
@@ -478,13 +589,13 @@ static void texgen(const RawVtx *r, const float nmodel[3], uint32_t c0, CoreVert
             s = in[0]; t = in[1];
         }
         if (dual && type == 0) {
-            uint32_t pinfo = xf_reg[XF_POSTTEX0 + g];
+            uint32_t pinfo = x->ptinfo[g];
             float v[3] = {s, t, q};
             if ((pinfo >> 8) & 1) {
                 float len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
                 if (len > 0) { v[0] /= len; v[1] /= len; v[2] /= len; }
             }
-            const float *pm = &xf_mem[0x500 + (pinfo & 63) * 4];
+            const float *pm = x->post[g];
             s = pm[0] * v[0] + pm[1] * v[1] + pm[2] * v[2] + pm[3];
             t = pm[4] * v[0] + pm[5] * v[1] + pm[6] * v[2] + pm[7];
             q = pm[8] * v[0] + pm[9] * v[1] + pm[10] * v[2] + pm[11];
@@ -497,35 +608,164 @@ static void texgen(const RawVtx *r, const float nmodel[3], uint32_t c0, CoreVert
 }
 
 // ---- vertex transform -------------------------------------------------------------------------
-static CoreVertex transform(const RawVtx *r) {
-    CoreVertex o;
-    const float *m = &xf_mem[(r->pnmtx & 63) * 4];
-    float x = r->pos[0], y = r->pos[1], z = r->pos[2];
+static void transform(const XfSnap *x, const RawVtx *r, CoreVertex *o) {
+    const float *m = x->mtx ? x->mtx + (r->pnmtx & 63) * 4 : x->pm;
+    float px = r->pos[0], py = r->pos[1], pz = r->pos[2];
     float pos[3];
-    pos[0] = m[0] * x + m[1] * y + m[2] * z + m[3];
-    pos[1] = m[4] * x + m[5] * y + m[6] * z + m[7];
-    pos[2] = m[8] * x + m[9] * y + m[10] * z + m[11];
-    o.x = pos[0]; o.y = pos[1]; o.z = pos[2];
+    pos[0] = m[0] * px + m[1] * py + m[2] * pz + m[3];
+    pos[1] = m[4] * px + m[5] * py + m[6] * pz + m[7];
+    pos[2] = m[8] * px + m[9] * py + m[10] * pz + m[11];
+    o->x = pos[0]; o->y = pos[1]; o->z = pos[2];
 
     float nmodel[3] = {0, 0, 1}, n[3] = {0, 0, 1};
     if (r->has_nrm) {
         nmodel[0] = r->nrm[0]; nmodel[1] = r->nrm[1]; nmodel[2] = r->nrm[2];
-        const float *nm = &xf_mem[0x400 + (r->pnmtx & 31) * 3];
+        const float *nm = x->nrm ? x->nrm + (r->pnmtx & 31) * 3 : x->nm;
         n[0] = nm[0] * nmodel[0] + nm[1] * nmodel[1] + nm[2] * nmodel[2];
         n[1] = nm[3] * nmodel[0] + nm[4] * nmodel[1] + nm[5] * nmodel[2];
         n[2] = nm[6] * nmodel[0] + nm[7] * nmodel[1] + nm[8] * nmodel[2];
         float len = sqrtf(dot3(n, n));
         if (len > 0) { n[0] /= len; n[1] /= len; n[2] /= len; }
     }
-    int nchan = xf_reg[XF_NUMCHAN] & 3;
-    o.color0 = nchan >= 1 ? light_channel(0, r, pos, n) : 0;
-    o.color1 = nchan >= 2 ? light_channel(1, r, pos, n) : 0;
-    texgen(r, nmodel, o.color0, &o);
-    return o;
+    o->color0 = x->nchan >= 1 ? light_channel(x, 0, r, pos, n) : 0;
+    o->color1 = x->nchan >= 2 ? light_channel(x, 1, r, pos, n) : 0;
+    texgen(x, r, nmodel, o->color0, o);
+}
+
+// Expand a primitive's transformed vertices into a triangle list.
+static void emit_triangles(int prim, const CoreVertex *tv, uint32_t count, CoreVertex *o) {
+    #define EMIT(i) (*o++ = tv[i])
+    switch (prim) {
+    case 0: case 1:  // quads
+        for (uint32_t i = 0; i + 3 < count; i += 4) { EMIT(i); EMIT(i + 1); EMIT(i + 2); EMIT(i); EMIT(i + 2); EMIT(i + 3); }
+        break;
+    case 2: for (uint32_t i = 0; i + 2 < count; i += 3) { EMIT(i); EMIT(i + 1); EMIT(i + 2); } break;
+    case 3:  // strip
+        for (uint32_t i = 0; i + 2 < count; i++) {
+            if (i & 1) { EMIT(i + 1); EMIT(i); EMIT(i + 2); } else { EMIT(i); EMIT(i + 1); EMIT(i + 2); }
+        }
+        break;
+    case 4: for (uint32_t i = 1; i + 1 < count; i++) { EMIT(0); EMIT(i); EMIT(i + 1); } break;  // fan
+    }
+    #undef EMIT
+}
+
+// ---- vertex jobs ------------------------------------------------------------------------------
+// Lighting and texgen dominate the GPU thread (per vertex: a few spot lights and
+// dual-transform texgens, each with square roots and divides). Draws are queued as
+// jobs: the GPU thread decodes the vertices, snapshots XF and reserves the output
+// range; worker threads transform and expand them. Workers touch only the job data
+// and their reserved output, never guest RAM or GX state. The frame is published
+// only once every job is done. TUROK_GX_WORKERS=n sets the pool size (0 = inline).
+typedef struct Chunk { struct Chunk *next; size_t used, cap; } Chunk;
+static Chunk *s_arena_head, *s_arena_cur;
+
+static void *arena_alloc(size_t n) {  // valid until the frame's jobs are done (arena_reset)
+    n = (n + 15) & ~(size_t)15;
+    for (;;) {
+        Chunk *c = s_arena_cur;
+        if (c && c->used + n <= c->cap) { void *p = (uint8_t *)(c + 1) + c->used; c->used += n; return p; }
+        if (c && c->next) { s_arena_cur = c->next; s_arena_cur->used = 0; continue; }
+        size_t cap = n > (8u << 20) ? n : (8u << 20);
+        Chunk *nc = malloc(sizeof(Chunk) + cap + 16);
+        nc->next = NULL; nc->used = 0; nc->cap = cap;
+        if (c) c->next = nc; else s_arena_head = nc;
+        s_arena_cur = nc;
+    }
+}
+static void arena_reset(void) { s_arena_cur = s_arena_head; if (s_arena_cur) s_arena_cur->used = 0; }
+
+typedef struct { const XfSnap *x; const RawVtx *raw; uint32_t count, out, prim; } DrawJob;
+#define JOB_MAX_DRAWS 128
+#define JOB_TARGET_VERTS 1024
+typedef struct { FrameSlot *slot; uint32_t n, verts; DrawJob d[JOB_MAX_DRAWS]; } Job;
+
+static Job *s_job;                     // being filled by the GPU thread
+static Job *s_jobq[1024];
+static uint32_t s_jobq_head, s_jobq_tail;  // under s_job_lock
+static SRWLOCK s_job_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_job_cv = CONDITION_VARIABLE_INIT;
+static volatile LONG s_jobs_done;
+static LONG s_jobs_sent;
+static int s_workers = -1;
+volatile uint64_t g_xf_tsc;            // time spent transforming, all threads ([stats])
+
+static void run_job(Job *j) {
+    static __declspec(thread) CoreVertex *t_buf;  // transformed vertices of one draw (up to 4096)
+    if (!t_buf) t_buf = malloc(sizeof(CoreVertex) * 4096);
+    uint64_t t0 = __rdtsc();
+    for (uint32_t k = 0; k < j->n; k++) {
+        const DrawJob *d = &j->d[k];
+        for (uint32_t i = 0; i < d->count; i++) transform(d->x, &d->raw[i], &t_buf[i]);
+        emit_triangles((int)d->prim, t_buf, d->count, j->slot->vtx + d->out);
+    }
+    InterlockedAdd64((volatile LONG64 *)&g_xf_tsc, (LONG64)(__rdtsc() - t0));
+}
+
+static Job *job_pop(void) {  // caller holds s_job_lock
+    if (s_jobq_head == s_jobq_tail) return NULL;
+    return s_jobq[s_jobq_head++ % 1024];
+}
+
+static DWORD WINAPI xf_worker(LPVOID arg) {
+    (void)arg;
+    for (;;) {
+        AcquireSRWLockExclusive(&s_job_lock);
+        Job *j;
+        while (!(j = job_pop())) SleepConditionVariableSRW(&s_job_cv, &s_job_lock, INFINITE, 0);
+        ReleaseSRWLockExclusive(&s_job_lock);
+        run_job(j);
+        InterlockedIncrement(&s_jobs_done);
+    }
+}
+
+static void job_submit(void) {
+    Job *j = s_job;
+    if (!j || !j->n) return;
+    s_job = NULL;
+    if (!s_workers) { run_job(j); return; }
+    AcquireSRWLockExclusive(&s_job_lock);
+    int full = s_jobq_tail - s_jobq_head >= 1024;
+    if (!full) s_jobq[s_jobq_tail++ % 1024] = j;
+    ReleaseSRWLockExclusive(&s_job_lock);
+    if (full) { run_job(j); return; }
+    s_jobs_sent++;
+    WakeConditionVariable(&s_job_cv);
+}
+
+// Wait until every queued job is done (helping with them meanwhile).
+static void jobs_drain(void) {
+    job_submit();
+    while (s_jobs_done != s_jobs_sent) {
+        AcquireSRWLockExclusive(&s_job_lock);
+        Job *j = job_pop();
+        ReleaseSRWLockExclusive(&s_job_lock);
+        if (j) { run_job(j); InterlockedIncrement(&s_jobs_done); }
+        else _mm_pause();
+    }
+}
+
+static void jobs_init(void) {
+    const char *e = getenv("TUROK_GX_WORKERS");
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    int n = e ? atoi(e) : (int)si.dwNumberOfProcessors - 4;  // leave room for guest, GPU, host, audio
+    s_workers = n < 0 ? 0 : n > 4 ? 4 : n;
+    for (int i = 0; i < s_workers; i++) CreateThread(NULL, 256 << 10, xf_worker, NULL, 0, NULL);
+    logf_("[gx] %d vertex worker thread(s)", s_workers);
+}
+
+// Queue one draw: count raw vertices into the output at s_build->vtx[out].
+static void job_add(const XfSnap *x, const RawVtx *raw, uint32_t count, uint32_t out, int prim) {
+    if (s_workers < 0) jobs_init();
+    if (!s_job) { s_job = arena_alloc(sizeof(Job)); s_job->slot = s_build; s_job->n = s_job->verts = 0; }
+    DrawJob *d = &s_job->d[s_job->n++];
+    d->x = x; d->raw = raw; d->count = count; d->out = out; d->prim = (uint32_t)prim;
+    s_job->verts += count;
+    if (s_job->n == JOB_MAX_DRAWS || s_job->verts >= JOB_TARGET_VERTS) job_submit();
 }
 
 // ---- draw state --------------------------------------------------------------------------------
-static void current_state(CoreBatch *b) {
+static void current_xf_state(CoreBatch *b) {
     // projection: row-major 4x4, z remapped from GX [-w, 0] to D3D [0, w]
     float pr[6]; memcpy(pr, &xf_reg[XF_PROJ], sizeof pr);
     int ortho = xf_reg[XF_PROJ + 6] != 0;
@@ -544,6 +784,10 @@ static void current_state(CoreBatch *b) {
     b->viewport[1] = (int32_t)(vp[4] - 342 + vp[1]);
     b->viewport[2] = (int32_t)(2 * vp[0]);
     b->viewport[3] = (int32_t)(-2 * vp[1]);
+}
+
+static void current_state(CoreBatch *b) {
+    current_xf_state(b);
     // SCISSORTL/BR: y in bits 0-10, x in bits 12-22, both offset by 342
     uint32_t tl = bp[0x20], br = bp[0x21];
     b->scissor[0] = (int32_t)((tl >> 12) & 0x7FF) - 342; b->scissor[1] = (int32_t)(tl & 0x7FF) - 342;
@@ -557,6 +801,25 @@ static void current_state(CoreBatch *b) {
         b->textures[i] = (maps & (1u << i)) ? frame_texture(i) : -1;
         b->sampler[i] = bp[mode0[i]];
     }
+}
+
+// Material, textures, samplers and scissor depend only on BP registers (plus the XF
+// viewport, for fog) and on what this frame already holds. Consecutive draws often
+// change nothing but matrices, so they are captured again only after such a write.
+static CoreBatch s_state_cache;
+
+static void draw_state(CoreBatch *b) {
+    if (s_state_dirty) {
+        current_state(b);
+        s_state_cache = *b;
+        s_state_dirty = 0;
+        return;
+    }
+    b->material = s_state_cache.material;
+    memcpy(b->textures, s_state_cache.textures, sizeof b->textures);
+    memcpy(b->sampler, s_state_cache.sampler, sizeof b->sampler);
+    memcpy(b->scissor, s_state_cache.scissor, sizeof b->scissor);
+    current_xf_state(b);
 }
 
 static int same_state(const CoreBatch *a, const CoreBatch *b) {
@@ -578,12 +841,28 @@ static int dumping(void) {
     return s_serial + 1 == s_dump_serial;
 }
 
+static void draw(uint8_t op, uint32_t count, const uint8_t *data);
 void gx_draw(uint8_t op, uint32_t count, const uint8_t *data) {
+    uint64_t t = __rdtsc();
+    draw(op, count, data);
+    s_st.draw_tsc += __rdtsc() - t;
+}
+
+static void draw(uint8_t op, uint32_t count, const uint8_t *data) {
     int prim = (op >> 3) & 7, vat = op & 7;
     if (count == 0 || count > 4096) return;
-    RawVtx *raw = _alloca(sizeof(RawVtx) * count);
+    RawVtx *raw = arena_alloc(sizeof(RawVtx) * count);
     const uint8_t *start = data;
-    for (uint32_t i = 0; i < count; i++) decode_vertex(&data, vat, &raw[i]);
+    vtx_format_setup(vat);
+    for (uint32_t i = 0; i < count; i++) decode_vertex(&data, &raw[i]);
+    // XF snapshot, shared by consecutive draws while XF and the matrix indices stay put
+    static XfSnap *s_snap;
+    if (s_xf_dirty || !s_snap || (cp_vcd_lo & 0x1FF)) {
+        s_snap = arena_alloc(sizeof(XfSnap));
+        xf_snapshot(s_snap);
+        s_xf_dirty = 0;
+    }
+    const XfSnap *x = s_snap;
     if (dumping()) {
         logf_("[draw] op %02X n %u vcd %08X/%08X vat %08X %08X %08X matA %08X stride %u tev %u map0 %d",
               op, count, cp_vcd_lo, cp_vcd_hi, cp_vat_a[vat], cp_vat_b[vat], cp_vat_c[vat], cp_matidx_a,
@@ -612,7 +891,7 @@ void gx_draw(uint8_t op, uint32_t count, const uint8_t *data) {
             const float *pm = &xf_mem[0x500 + (xf_reg[XF_POSTTEX0] & 63) * 4];
             logf_("    post0 [%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f]", pm[0], pm[1], pm[2], pm[3],
                   pm[4], pm[5], pm[6], pm[7], pm[8], pm[9], pm[10], pm[11]);
-            CoreVertex tv0 = transform(&raw[0]);
+            CoreVertex tv0; transform(x, &raw[0], &tv0);
             logf_("    out uv0 %.3f %.3f uv1 %.3f %.3f uv2 %.3f %.3f col0 %08X col1 %08X", tv0.uv[0][0], tv0.uv[0][1],
                   tv0.uv[1][0], tv0.uv[1][1], tv0.uv[2][0], tv0.uv[2][1], tv0.color0, tv0.color1);
         }
@@ -641,7 +920,7 @@ void gx_draw(uint8_t op, uint32_t count, const uint8_t *data) {
 
     CoreBatch st;
     memset(&st, 0, sizeof st);  // kind 0 = draw; copy fields unused
-    current_state(&st);
+    draw_state(&st);
     CoreBatch *last = s_build->nbat ? &s_build->bat[s_build->nbat - 1] : NULL;
     if (!last || last->kind != 0 || !same_state(last, &st) || last->first_vertex + last->vertex_count != s_build->nvtx) {
         s_build->bat = grow(s_build->bat, &s_build->capbat, s_build->nbat + 1, sizeof(CoreBatch));
@@ -655,26 +934,14 @@ void gx_draw(uint8_t op, uint32_t count, const uint8_t *data) {
     case 2: tris = count / 3; break;               // triangles
     case 3: case 4: tris = count >= 3 ? count - 2 : 0; break;  // strip / fan
     }
-    // transform each vertex once, then index into the triangle list
-    CoreVertex *tv = _alloca(sizeof(CoreVertex) * count);
-    for (uint32_t i = 0; i < count; i++) tv[i] = transform(&raw[i]);
-    s_build->vtx = grow(s_build->vtx, &s_build->capvtx, s_build->nvtx + tris * 3, sizeof(CoreVertex));
-    CoreVertex *o = s_build->vtx + s_build->nvtx;
-    #define EMIT(i) (*o++ = tv[i])
-    switch (prim) {
-    case 0: case 1:
-        for (uint32_t i = 0; i + 3 < count; i += 4) { EMIT(i); EMIT(i + 1); EMIT(i + 2); EMIT(i); EMIT(i + 2); EMIT(i + 3); }
-        break;
-    case 2: for (uint32_t i = 0; i + 2 < count; i += 3) { EMIT(i); EMIT(i + 1); EMIT(i + 2); } break;
-    case 3:
-        for (uint32_t i = 0; i + 2 < count; i++) {
-            if (i & 1) { EMIT(i + 1); EMIT(i); EMIT(i + 2); } else { EMIT(i); EMIT(i + 1); EMIT(i + 2); }
-        }
-        break;
-    case 4: for (uint32_t i = 1; i + 1 < count; i++) { EMIT(0); EMIT(i); EMIT(i + 1); } break;
+    if (!tris) return;
+    uint32_t need = s_build->nvtx + tris * 3;
+    if (need > s_build->capvtx) {
+        jobs_drain();  // queued jobs write into the vertex array: let them finish before it moves
+        s_build->vtx = grow(s_build->vtx, &s_build->capvtx, need, sizeof(CoreVertex));
     }
-    #undef EMIT
-    s_build->nvtx += tris * 3;
+    job_add(x, raw, count, s_build->nvtx, prim);
+    s_build->nvtx = need;
     last->vertex_count += tris * 3;
 }
 

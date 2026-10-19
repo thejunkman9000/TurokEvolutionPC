@@ -3,6 +3,7 @@
 #include "ppc.h"
 #include "host.h"
 #include "hw.h"
+#include "gx.h"
 
 uint8_t *g_ram;
 uint8_t g_lockedcache[0x4000];
@@ -62,6 +63,7 @@ uint32_t mmio_read(uint32_t addr, int size) {
 
 void mmio_write(uint32_t addr, uint32_t v, int size) {
     uint32_t off = addr & 0xFFFF;
+    if (off - 0x8000 < 0x1000) { gx_fifo_write(v, size); return; }  // write-gather pipe: by far the most frequent
     if (hw_write(off, v, size)) return;
     shadow_write(off, v, size);
     if (!s_seen_w[off]) {

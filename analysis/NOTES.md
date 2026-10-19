@@ -140,6 +140,48 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - Texture lookups are now memoized per frame, with a TLUT-load generation counter for palette textures, and EFB copies are verified once per frame.
   - Profiling: `TUROK_PROFILE=<start s>,<duration s>` logs the top self and inclusive functions of the guest thread. A `[stats]` line each second reports fps, draws and vertices per frame, and line/point, indirect and Z-copy usage.
   - Host draw cost is about 0.6 ms per frame; `host_stats.txt` is written on exit.
+- **60 fps in the heaviest levels** (GX on its own thread, vertex worker pool):
+  - Fps from the in-level `[stats]` lines on the scripted New Game path, excluding the loading seconds; uncapped (`--no-vsync`), HEAD before → after. The heavy views are 6.9k-8.6k draws and 65k-85k verts per frame:
+
+    | level | before avg / min | after avg / min | with vsync, after |
+    |---|---|---|---|
+    | sc-11-a (city senate) | 36.7 / 29.8 | 59.8 / 56.8 | 59.9 |
+    | sc-12-a | 46.5 / 29.8 | 59.7 / 53.0 | 59.8 |
+    | rwp1 | 53.2 / 29.9 | 59.9 / 59.8 | 59.8 |
+    | darkjungle_1 | 31.0 / 19.4 | 59.8 / 56.6 | 59.9 |
+
+    The remaining dips are level-load stalls and single guest-side hitches (game streaming); the GPU thread's per-frame max stays under 9 ms.
+  - Why 30 fps, not 49: the main loop ends each frame with GXSetDrawSync and spins on GXReadDrawSync (fn_8000B9B8 → fn_80132300) before VIWaitForRetrace. A frame that misses the retrace waits for the next one, so heavy views locked to exactly 30. The sc-11-a pipe view was busy 20.5 ms per frame, 9.5 ms of it in gx_draw.
+  - The command processor now runs on a **GPU thread** (`gx_fifo.c`). The guest copies the bytes the CP reads into an 8 MB ring; the thread parses them and runs all of `gx_render.c`.
+    - This matches the hardware: commands read guest RAM (display lists, vertex arrays, textures, TLUTs) when parsed, and PE token/finish interrupts are raised when the thread reaches them.
+    - The game's only GPU sync is the one draw-sync token per frame (no GXDrawDone), so it already tolerates an asynchronous GPU.
+    - The PE status bits are updated atomically. The CP status register reports GP idle only once the ring is drained.
+    - `TUROK_GX_THREAD=0` parses on the guest thread as before.
+  - **Vertex jobs** (`gx_render.c`): in Dark Jungle each vertex averages ~1.7 spot lights and ~2.4 dual-transform texgens (sqrt and divides), about 63 ns per vertex.
+    - The GPU thread decodes vertices into a per-frame arena, snapshots what the transform needs (`XfSnap`: matrices, light parameters, channel/texgen controls, post matrices), and reserves the output range.
+    - Worker threads (`TUROK_GX_WORKERS`, default ncpu-4 capped at 4; 0 = inline) light, texgen and expand into triangles. They never touch guest RAM or GX state.
+    - The frame is published only after all its jobs finish. A vertex-array realloc first drains the jobs.
+    - Anything that changes what lighting/texgen read must go through `xf_snapshot`.
+  - **Cheaper GPU-thread work:**
+    - The vertex format (VCD/VAT) is decoded once per draw.
+    - The state capture (material, textures, samplers, scissor) is reused while no BP register or XF viewport has been written since the previous draw. Dark Jungle: 104 captures for 8.5k draws.
+    - An XF snapshot is shared by consecutive draws until XF or the matrix indices change.
+  - **Guest-side fixes:**
+    - `getenv("TUROK_LOG_REDIRECT")` was called on every redirected gather-pipe burst. This was 6% of the guest thread as `strchr`, from CPU skinning.
+    - `call_indirect` uses a direct-mapped table instead of a binary search.
+    - The GQR scales come from tables instead of `ldexp`.
+    - Gather-pipe writes are dispatched first in `mmio_write`.
+    - The CP FIFO feeds contiguous ranges instead of 32-byte pieces.
+  - **Verified unchanged:** a temporary build ran the old and new pipelines side by side.
+    - For every draw, the state matched the full recapture (~6M draws). For every published frame, the vertex array was byte-identical to the old single-threaded pipeline (4,800 frames each of darkjungle_1 and sc-11-a, with 4 workers).
+    - The host is unchanged. Screenshots across runs differ only in animation phase, because the game runs on wall-clock time.
+  - **`[stats]` fields** (per frame):
+    - `busy`: guest time outside VIWaitForRetrace (hle.c override), with the per-second max.
+    - `gpu`: GPU-thread parse time, with the per-frame max.
+    - `draw`: the gx_draw part of that.
+    - `xf`: transform time summed over the workers.
+  - Gotcha: the host process runs with CET shadow stacks (.NET 9). A `longjmp` that skips the unwinder (`_JUMP_BUFFER.Frame = 0`) kills the host instantly with no log, though `turok_run.exe` survives it. Interrupt returns must keep the normal unwinding longjmp.
+  - Gotcha: `build.ps1` writes `%TEMP%\turok_native_build.cmd`, so parallel builds in different worktrees race on it. Use a private copy for incremental builds.
 - **Indirect texturing (bump)** follows Dolphin's integer semantics:
   - Indirect stages are sampled at shifted coordinates, then each stage's format, bias and bump alpha are applied, followed by the static or S/T-dynamic matrices and the wrap/add-previous steps, with s24 wrap.
   - Stages sample with explicit gradients. Setup-unit texcoord sizes come from BP 0x30+.

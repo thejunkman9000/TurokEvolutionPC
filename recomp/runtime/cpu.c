@@ -25,7 +25,23 @@ const FuncEntry *func_containing(uint32_t addr) {
     return lo ? &g_func_table[lo - 1] : NULL;
 }
 
+// Indirect calls (virtual methods, function pointers) are frequent: a direct-mapped
+// table over the text section replaces the binary search.
+static GuestFn *s_fn_map;
+static uint32_t s_fn_base, s_fn_words;
+
+static void fn_map_init(void) {
+    s_fn_base = g_func_table[0].addr;
+    s_fn_words = (g_func_table[g_func_count - 1].addr - s_fn_base) / 4 + 1;
+    s_fn_map = calloc(s_fn_words, sizeof *s_fn_map);
+    for (unsigned i = 0; i < g_func_count; i++)
+        if (!(g_func_table[i].addr & 3)) s_fn_map[(g_func_table[i].addr - s_fn_base) / 4] = g_func_table[i].fn;
+}
+
 void call_indirect(PPCContext *c, uint32_t addr) {
+    if (!s_fn_map) fn_map_init();
+    uint32_t w = (addr - s_fn_base) / 4;
+    if (w < s_fn_words && !(addr & 3) && s_fn_map[w]) { s_fn_map[w](c); return; }
     const FuncEntry *e = func_lookup(addr);
     if (!e) fatal("call_indirect: no function at %08X (lr=%08X)", addr, c->lr);
     e->fn(c);
@@ -101,9 +117,18 @@ void ppc_mtspr(PPCContext *c, int spr, uint32_t v) {
 }
 
 // ---- paired-single quantised load/store -------------------------------------
+// GQR scales are 6-bit signed powers of two: tables instead of ldexp per access.
+static double s_ld_scale[64], s_st_scale[64];
+static void scale_init(void) {
+    for (int i = 0; i < 64; i++) {
+        int sc = (i & 0x20) ? i - 64 : i;
+        s_ld_scale[i] = ldexp(1.0, -sc);
+        s_st_scale[i] = ldexp(1.0, sc);
+    }
+}
 static double ldexp_scale(int scale) {  // 6-bit signed scale
-    if (scale & 0x20) scale -= 64;
-    return ldexp(1.0, -scale);
+    if (s_ld_scale[0] == 0) scale_init();
+    return s_ld_scale[scale & 0x3F];
 }
 static double dequant(uint32_t ea, int type, double scale, int *size) {
     switch (type) {
@@ -136,9 +161,8 @@ static void quant(uint32_t ea, int type, double v, double scale, int *size) {
 void psq_store(PPCContext *c, int frs, uint32_t ea, int w, int i) {
     uint32_t gqr = c->spr[SPR_GQR0 + i];
     int type = gqr & 7;
-    int sc = (gqr >> 8) & 0x3F;
-    if (sc & 0x20) sc -= 64;
-    double scale = ldexp(1.0, sc);
+    if (s_st_scale[0] == 0) scale_init();
+    double scale = s_st_scale[(gqr >> 8) & 0x3F];
     int sz;
     quant(ea, type, c->f[frs], scale, &sz);
     if (!w) quant(ea + sz, type, c->ps1[frs], scale, &sz);
