@@ -189,6 +189,7 @@ static void stats_frame(void) {
 
 static void jobs_drain(void);
 static void arena_reset(void);
+void look_stamp_pop(double *yaw, double *pitch, float *pitch_deg, uint32_t *valid);
 static void publish_frame(void) {
     jobs_drain();  // every vertex of the frame is written
     stats_frame();
@@ -199,6 +200,7 @@ static void publish_frame(void) {
     f->f.batch_count = f->nbat; f->f.vertex_count = f->nvtx;
     f->f.texture_count = f->ntex; f->f.material_count = f->nmat;
     f->f.batches = f->bat; f->f.vertices = f->vtx; f->f.textures = f->tex; f->f.materials = f->mat;
+    look_stamp_pop(&f->f.look_yaw, &f->f.look_pitch, &f->f.look_pitch_deg, &f->f.look_valid);
     frame_lock();
     if (s_ready) s_free_list[s_nfree++] = s_ready;  // host never took it: drop
     s_ready = f;

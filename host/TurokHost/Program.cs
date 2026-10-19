@@ -14,8 +14,11 @@ internal static class Program
         //                    [--level data/levels/<pod>/<name>/<name>.atr]  (New Game starts that level)
         //                    [--mouse-sens X]  (mouse look speed multiplier, default 1)
         //                    [--invert-look]   (keep the game's inverted look on the pad's right stick)
+        //                    [--speed X]       (game speed, e.g. 2; hold Tab to fast-forward 4x)
+        //                    [--show-intro]    (play the logos and intro movie; skipped by default)
         string? iso = null;
         var opt = new TurokGame.Options();
+        bool showIntro = false;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i].ToLowerInvariant())
@@ -24,6 +27,9 @@ internal static class Program
             case "--no-vsync": opt = opt with { VSync = false }; break;
             case "--widescreen": opt = opt with { Widescreen = true }; break;
             case "--invert-look": opt = opt with { InvertLook = true }; break;
+            case "--show-intro": showIntro = true; break;
+            case "--speed" when i + 1 < args.Length && float.TryParse(args[i + 1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sp):
+                opt = opt with { Speed = sp }; i++; break;
             case "--level" when i + 1 < args.Length: Environment.SetEnvironmentVariable("TUROK_LEVEL", args[++i]); break;
             case "--mouse-sens" when i + 1 < args.Length && float.TryParse(args[i + 1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ms):
                 opt = opt with { MouseSensitivity = ms }; i++; break;
@@ -31,6 +37,11 @@ internal static class Program
             default: iso ??= args[i]; break;
             }
         }
+        // Intro skip: the core swaps the boot sequence (logos, legal, intro movie) for the
+        // title screen, fast-forwards it and presses Start, landing on the main menu.
+        // An explicit TUROK_SKIP_INTRO (e.g. 0 for scripted test runs) wins.
+        if (Environment.GetEnvironmentVariable("TUROK_SKIP_INTRO") == null)
+            Environment.SetEnvironmentVariable("TUROK_SKIP_INTRO", showIntro ? "0" : "frontendbackground");
         iso ??= FindIso();
         if (iso == null || !File.Exists(iso))
         {

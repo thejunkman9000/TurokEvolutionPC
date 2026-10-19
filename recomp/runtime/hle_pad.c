@@ -11,6 +11,7 @@
 
 typedef struct { uint16_t buttons; int8_t sx, sy, cx, cy; uint8_t l, r; } PadState;
 extern PadState g_pads[4];
+extern uint64_t g_auto_start_at;
 
 #define PAD_ERR_NONE 0
 #define PAD_ERR_NO_CONTROLLER -1
@@ -22,6 +23,12 @@ void SYM_PADRead(PPCContext *c) {
         for (int i = 0; i < 12; i++) wr8(p + i, 0);
         if (port != 0) { wr8(p + 10, (uint8_t)PAD_ERR_NO_CONTROLLER); continue; }
         PadState s = g_pads[port];
+        // Intro skip: tap Start on the title screen.
+        if (g_auto_start_at) {
+            uint64_t now = host_time_ticks();
+            if (now >= g_auto_start_at) s.buttons |= 0x1000;
+            if (now >= g_auto_start_at + TB_FREQ / 20) g_auto_start_at = 0;  // ~3 frames
+        }
         wr16(p + 0, s.buttons);
         wr8(p + 2, (uint8_t)s.sx);
         wr8(p + 3, (uint8_t)s.sy);

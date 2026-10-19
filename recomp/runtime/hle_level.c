@@ -17,6 +17,10 @@
 
 static int s_redirected;
 
+// Intro skip state: fast-forward the front end and press Start on the title screen.
+void core_speed_boost(float boost);
+uint64_t g_auto_start_at;  // guest ticks; hle_pad.c holds Start briefly from then
+
 static void read_guest_str(uint32_t a, char *out, size_t n) {
     size_t i = 0;
     for (; i + 1 < n; i++) { char ch = (char)rd8(a + (uint32_t)i); if (!ch) break; out[i] = ch; }
@@ -26,6 +30,24 @@ static void read_guest_str(uint32_t a, char *out, size_t n) {
 void fn_80019700(PPCContext *c) {
     char path[260];
     read_guest_str(c->r[4], path, sizeof path);
+    // Intro skip (TUROK_SKIP_INTRO=<screen>): the boot sequence (logos, legal, intro movie)
+    // is replaced by a later front-end screen.
+    char skip_buf[64];
+    if (strstr(path, "bootupsequence") &&
+        GetEnvironmentVariableA("TUROK_SKIP_INTRO", skip_buf, sizeof skip_buf) && skip_buf[0] && skip_buf[0] != '0') {
+        char repl[200];
+        int n = snprintf(repl, sizeof repl, "data\\levels\\u_jcowlishaw\\screens\\%s\\%s.atr", skip_buf, skip_buf);
+        for (int i = 0; i <= n; i++) wr8(LEVEL_PATH_ADDR + 0x100 + i, (uint8_t)repl[i]);
+        c->r[4] = LEVEL_PATH_ADDR + 0x100;
+        logf_("[level] load %s -> %s (intro skip)", path, repl);
+        core_speed_boost(4.f);
+        orig_80019700(c);
+        return;
+    }
+    if (GetEnvironmentVariableA("TUROK_SKIP_INTRO", skip_buf, sizeof skip_buf) && skip_buf[0] && skip_buf[0] != '0') {
+        if (strstr(path, "firstinteractivescreen")) g_auto_start_at = host_time_ticks() + TB_FREQ;  // after 1 s
+        if (strstr(path, "mainmenu")) core_speed_boost(1.f);
+    }
     // Win32 lookup, not getenv: the host's --level sets it after the CRT copied the environment.
     char want_buf[260];
     DWORD wl = GetEnvironmentVariableA("TUROK_LEVEL", want_buf, sizeof want_buf);

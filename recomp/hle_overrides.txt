@@ -35,6 +35,7 @@ CARDSetStatus
 
 # Mouse look: applied once per frame at the C-stick poll (GetAxisX): runtime/hle_look.c.
 80007734  # GetAxisX(port, id)
+GXCopyDisp  # frame end: look stamp for the host's view reprojection
 
 # Frame timing for the [stats] line (time the guest spends waiting for retrace): runtime/hle.c.
 VIWaitForRetrace

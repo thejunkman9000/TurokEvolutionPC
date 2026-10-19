@@ -41,6 +41,18 @@ internal sealed class TurokGame : Game
     private readonly List<MaterialParams> _materials = new();
     private Color _clearColor = Color.Black;
     private uint _lastSerial;
+    private long _framesRepeated, _framesSkipped;
+    // View reprojection: mouse motion sent to the core (running totals, radians) vs the
+    // amount the shown frame had consumed; the difference rotates the frame's 3D draws.
+    private double _sentYaw, _sentPitch;
+    private double _frameLookYaw, _frameLookPitch;
+    private float _frameLookPitchDeg;
+    private bool _frameLookValid;
+    private Matrix _viewRot = Matrix.Identity;
+    private bool _viewRotActive;
+    private readonly int _batchInfoFrame = int.TryParse(Environment.GetEnvironmentVariable("TUROK_BATCHINFO"), out var bi) ? bi : -1;
+    private System.Text.StringBuilder? _batchInfo;
+    private readonly Vector2 _reprojTest = ParseReprojTest();  // presents that showed an old frame / game frames never shown
     private int _framesReceived;
 
     private readonly Dictionary<uint, (Texture2D Tex, int LastUsed)> _textures = new();
@@ -56,6 +68,13 @@ internal sealed class TurokGame : Game
     // Mouse look: click in the window to capture the mouse, Esc to release.
     private bool _mouseCaptured;
     private bool _escHeld;
+    private readonly float _baseSpeed;
+    private float _speed = 1f;  // effective game speed (Tab fast-forward, intro skip)
+    private const float FastForward = 4f;
+    private RawMouse? _rawMouse;
+    private readonly System.Diagnostics.Stopwatch _refreshWatch = System.Diagnostics.Stopwatch.StartNew();
+    private double _refreshMs = 16.7;  // smoothed display refresh interval
+    private int _refreshCount;
     private int _prevWheel;
     private readonly bool _invertLook;
     private readonly List<(PadButtons button, int age)> _pulses = new();
@@ -73,6 +92,7 @@ internal sealed class TurokGame : Game
     private sealed class Batch
     {
         public Matrix Projection;
+        public bool Reproject;  // full-screen perspective draw: rotated with the mouse between game frames
         public int First, Count;
         public int Material;
         public readonly Texture2D?[] Textures = new Texture2D?[8];
@@ -102,13 +122,14 @@ internal sealed class TurokGame : Game
     }
 
     public sealed record Options(int Scale = 2, bool Fullscreen = false, bool VSync = true, bool Widescreen = false,
-                                 float MouseSensitivity = 1f, bool InvertLook = false);
+                                 float MouseSensitivity = 1f, bool InvertLook = false, float Speed = 1f);
 
     public TurokGame(string isoPath, Options? options = null)
     {
         options ??= new Options();
         _mouseRadPerPixel = MouseRadiansPerPixel * options.MouseSensitivity;
         _invertLook = options.InvertLook;
+        _baseSpeed = Math.Clamp(options.Speed, 0.25f, 8f);
         _isoPath = isoPath;
         RenderScale = Math.Clamp(options.Scale, 1, 4);
         EfbWidth = options.Widescreen ? 854 : 640;
@@ -125,6 +146,9 @@ internal sealed class TurokGame : Game
         };
         IsMouseVisible = true;
         Window.AllowUserResizing = true;
+        // Run one update+draw per display refresh (vsync), not MonoGame's fixed 60 Hz
+        // step, which drifts against the display and drops/doubles frames.
+        IsFixedTimeStep = false;
         Window.Title = "Turok: Evolution (recompiled)";
         // TUROK_SCREENSHOT=120,400,...: capture those frames (exit after the last
         // one if TUROK_EXIT_AFTER_SCREENSHOT=1).
@@ -156,6 +180,7 @@ internal sealed class TurokGame : Game
     protected override void Initialize()
     {
         base.Initialize();
+        _rawMouse = new RawMouse(Window.Handle);
         if (!Core.Start(_isoPath, "turok_recomp.log"))
         {
             Core.State(out var msg);
@@ -194,9 +219,28 @@ internal sealed class TurokGame : Game
         if (on) Mouse.SetPosition(Window.ClientBounds.Width / 2, Window.ClientBounds.Height / 2);
     }
 
+    // Each update follows a vsync'd present. On a ~60 Hz display, tick the guest's
+    // retrace once per refresh (every other refresh at ~120 Hz) so every game frame is
+    // shown exactly once; otherwise the core keeps its own 59.94 Hz timer.
+    private void PaceRetrace()
+    {
+        double ms = _refreshWatch.Elapsed.TotalMilliseconds;
+        _refreshWatch.Restart();
+        if (ms > 0.5 && ms < 100) _refreshMs += (ms - _refreshMs) * 0.05;
+        _refreshCount++;
+        if (!_graphics.SynchronizeWithVerticalRetrace || _speed != 1f) return;
+        if (_refreshMs > 15.0 && _refreshMs < 18.5) Core.VSync();
+        else if (_refreshMs > 7.5 && _refreshMs < 9.2 && (_refreshCount & 1) == 0) Core.VSync();
+    }
+
     // ---- input ---------------------------------------------------------------------
     protected override void Update(GameTime gameTime)
     {
+        PaceRetrace();
+        // Game speed: --speed, times 4 while Tab is held (fast-forward).
+        bool ff = IsActive && Keyboard.GetState().IsKeyDown(Keys.Tab);
+        Core.SetSpeed(_baseSpeed * (ff ? FastForward : 1f));
+        _speed = Core.GetSpeed();
         var kb = Keyboard.GetState();
         var gp = GamePad.GetState(PlayerIndex.One);
         if (kb.IsKeyDown(Keys.F12)) _screenshotPending = true;
@@ -282,10 +326,16 @@ internal sealed class TurokGame : Game
         if (_mouseCaptured)
         {
             float dx = mouse.X - center.X, dy = mouse.Y - center.Y;
-            Mouse.SetPosition(center.X, center.Y);
+            Mouse.SetPosition(center.X, center.Y);  // keep the (hidden) cursor in the window
+            if (_rawMouse is { Available: true }) { var (rx, ry) = _rawMouse.Take(); dx = rx; dy = ry; }
             if (firstPerson)
             {
-                if (dx != 0 || dy != 0) Core.MouseLook(-dx * _mouseRadPerPixel, -dy * _mouseRadPerPixel);
+                if (dx != 0 || dy != 0)
+                {
+                    float yaw = -dx * _mouseRadPerPixel, pitch = -dy * _mouseRadPerPixel;
+                    Core.MouseLook(yaw, pitch);
+                    _sentYaw += yaw; _sentPitch += pitch;
+                }
             }
             else
             {
@@ -301,7 +351,7 @@ internal sealed class TurokGame : Game
                 for (int i = 0; i < Math.Min(Math.Abs(notches), 4); i++)
                     _pulses.Add((notches > 0 ? PadButtons.Y : PadButtons.B, 0));
         }
-        else _prevWheel = mouse.ScrollWheelValue;
+        else { _prevWheel = mouse.ScrollWheelValue; _rawMouse?.Take(); }
 
         // Fire / zoom: left / right mouse, right / left trigger.
         bool mouseFire = _mouseCaptured && !_swallowClick && mouse.LeftButton == ButtonState.Pressed;
@@ -373,6 +423,8 @@ internal sealed class TurokGame : Game
             for (int i = 0; i < 2 * n; i++) _audioQueue.Enqueue(_audioFrames[i]);
         } while (n == _audioFrames.Length / 2);
 
+        // Fast-forward: the game produces audio faster than real time; drop it.
+        if (_speed != 1f) _audioQueue.Clear();
         // If we fell behind (clock drift, a stall), drop the oldest audio to keep latency low.
         int maxSamples = rate / 4 * 2;  // 250 ms of stereo samples
         while (_audioQueue.Count > maxSamples) { _audioQueue.Dequeue(); _audioQueue.Dequeue(); }
@@ -395,7 +447,7 @@ internal sealed class TurokGame : Game
     {
         File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "host_stats.txt"),
             $"audio: rate {_soundRate} submitted {_audioSubmitted} buffers ({_audioSubmitted * AudioChunkFrames / (double)Math.Max(1, _soundRate):F1} s), starved updates {_audioStarved}\n" +
-            $"draw: {_drawCount} calls, avg {_drawMsTotal / Math.Max(1, _drawCount):F2} ms, max {_drawMsMax:F1} ms; game frames received {_framesReceived}\n");
+            $"draw: {_drawCount} calls, avg {_drawMsTotal / Math.Max(1, _drawCount):F2} ms, max {_drawMsMax:F1} ms; game frames received {_framesReceived}, repeated presents {_framesRepeated}, skipped {_framesSkipped}; refresh {_refreshMs:F2} ms\n");
         base.OnExiting(sender, args);
     }
 
@@ -403,11 +455,16 @@ internal sealed class TurokGame : Game
     private unsafe void PullFrame()
     {
         CoreFrame* f = Core.AcquireFrame();
-        if (f == null) return;
+        if (f == null) { if (_framesReceived > 0) _framesRepeated++; return; }
         try
         {
-            if (f->Serial == _lastSerial) return;
+            if (f->Serial == _lastSerial) { _framesRepeated++; return; }
+            if (_lastSerial != 0 && f->Serial - _lastSerial > 1) _framesSkipped += f->Serial - _lastSerial - 1;
             _lastSerial = f->Serial;
+            _frameLookYaw = f->LookYaw; _frameLookPitch = f->LookPitch;
+            _frameLookPitchDeg = f->LookPitchDeg; _frameLookValid = f->LookValid != 0;
+            if (_batchInfo != null && _batchInfoFrame + 1 == _framesReceived)
+                File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "batchinfo.txt"), _batchInfo.ToString());
             _framesReceived++;
             _clearColor = new Color(f->ClearColor);
 
@@ -449,6 +506,23 @@ internal sealed class TurokGame : Game
                     b.Samplers[t] = Sampler(cb->Sampler[t]);
                 }
                 bool perspective = m[15] == 0f;
+                // World draws only: the first-person weapon is drawn in view space right in
+                // front of the camera (|z| < 0.6) and must stay attached to it.
+                b.Reproject = perspective && cb->Viewport[2] >= 600 && cb->Viewport[3] >= 400;
+                if (b.Reproject)
+                {
+                    float far = 0;
+                    TevVertex* vv = f->Vertices + cb->FirstVertex;
+                    for (int v = 0; v < cb->VertexCount; v++) far = Math.Max(far, -vv[v].Position.Z);
+                    b.Reproject = far > 2f;
+                }
+                if (_batchInfoFrame == _framesReceived)
+                {
+                    float zmin = float.MaxValue, zmax = float.MinValue;
+                    for (int v = 0; v < cb->VertexCount; v++) { float z = f->Vertices[cb->FirstVertex + v].Position.Z; zmin = Math.Min(zmin, z); zmax = Math.Max(zmax, z); }
+                    _batchInfo ??= new System.Text.StringBuilder();
+                    _batchInfo.AppendLine($"{i} kind {cb->Kind} n {cb->VertexCount} persp {perspective} P11 {m[0]:F3} P22 {m[5]:F3} P33 {m[10]:F5} P34 {m[11]:F3} vp {cb->Viewport[0]},{cb->Viewport[1]},{cb->Viewport[2]},{cb->Viewport[3]} z {zmin:F2}..{zmax:F2}");
+                }
                 bool widen = _centerOff != 0 && perspective && cb->Viewport[0] <= 16 && cb->Viewport[2] >= 600;
                 if (widen)
                 {
@@ -742,9 +816,52 @@ internal sealed class TurokGame : Game
         base.Draw(gameTime);
     }
 
+    // Rotation from the shown frame's camera to where the mouse has turned since: yaw
+    // about world up, then pitch, in GX view space (x right, y up, looking down -z).
+    private void UpdateViewRotation()
+    {
+        _viewRotActive = false;
+        if (!_frameLookValid || !Core.FirstPerson()) return;
+        const float Limit = 70f * MathF.PI / 180f;
+        float dy = Math.Clamp((float)(_sentYaw - _frameLookYaw), -0.15f, 0.15f) + _reprojTest.X;
+        float p0 = _frameLookPitchDeg * MathF.PI / 180f;
+        float p1 = Math.Clamp(p0 + Math.Clamp((float)(_sentPitch - _frameLookPitch), -0.15f, 0.15f) + _reprojTest.Y, -Limit, Limit);
+        if (MathF.Abs(dy) < 1e-5f && MathF.Abs(p1 - p0) < 1e-5f) return;
+        // Column-vector form M = Rx(-p1) * Ry(-dy) * Rx(p0); MonoGame multiplies row
+        // vectors, so the matrix passed on is its transpose.
+        static float[,] Rx(float t) { float c = MathF.Cos(t), s = MathF.Sin(t); return new float[,] { { 1, 0, 0 }, { 0, c, -s }, { 0, s, c } }; }
+        static float[,] Ry(float t) { float c = MathF.Cos(t), s = MathF.Sin(t); return new float[,] { { c, 0, s }, { 0, 1, 0 }, { -s, 0, c } }; }
+        static float[,] Mul(float[,] a, float[,] b)
+        {
+            var r = new float[3, 3];
+            for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) for (int k = 0; k < 3; k++) r[i, j] += a[i, k] * b[k, j];
+            return r;
+        }
+        var m = Mul(Mul(Rx(-p1), Ry(-dy)), Rx(p0));
+        _viewRot = new Matrix(m[0, 0], m[1, 0], m[2, 0], 0,
+                              m[0, 1], m[1, 1], m[2, 1], 0,
+                              m[0, 2], m[1, 2], m[2, 2], 0,
+                              0, 0, 0, 1);
+        _viewRotActive = true;
+    }
+
+    // TUROK_REPROJ_TEST="yaw,pitch": constant extra rotation (radians) to check the
+    // reprojection's direction against a real turn of the same size.
+    private static Vector2 ParseReprojTest()
+    {
+        var e = Environment.GetEnvironmentVariable("TUROK_REPROJ_TEST");
+        if (string.IsNullOrEmpty(e)) return Vector2.Zero;
+        var f = e.Split(',');
+        float.TryParse(f[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var y);
+        float p = 0;
+        if (f.Length > 1) float.TryParse(f[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out p);
+        return new Vector2(y, p);
+    }
+
     private void DrawFrame()
     {
         PullFrame();
+        UpdateViewRotation();
         var gd = GraphicsDevice;
         gd.SetRenderTarget(_target);
         gd.Clear(ClearOptions.Target | ClearOptions.DepthBuffer, _clearColor, 1f, 0);
@@ -765,7 +882,7 @@ internal sealed class TurokGame : Game
             gd.DepthStencilState = _debugView == 6 && m.IndMisc.Y != 0 ? DepthStencilState.None : m.Depth;
             gd.BlendState = m.Blend;
 
-            P["Proj"].SetValue(b.Projection);
+            P["Proj"].SetValue(_viewRotActive && b.Reproject ? _viewRot * b.Projection : b.Projection);
             P["ColorIn"].SetValue(m.ColorIn); P["AlphaIn"].SetValue(m.AlphaIn);
             P["ColorOp"].SetValue(m.ColorOp); P["AlphaOp"].SetValue(m.AlphaOp);
             P["Stage"].SetValue(m.Stage); P["Swap"].SetValue(m.Swap); P["Konst"].SetValue(m.Konst);

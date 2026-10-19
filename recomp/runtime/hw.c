@@ -4,6 +4,7 @@
 #include <time.h>
 #include "ppc.h"
 #include "hw.h"
+#include "core_api.h"
 #include "host.h"
 #include "gx.h"
 
@@ -316,10 +317,33 @@ static int vi_write(uint32_t off, uint32_t v, int size) {
     return 1;
 }
 
+// Retrace pacing. Normally the host calls core_vsync() once per display refresh
+// (60 Hz displays) so each game frame lines up with exactly one presented frame;
+// a free-running 59.94 Hz timer beats against the display and shows as judder.
+// Without host ticks for 50 ms (other refresh rates, vsync off) the timer is used.
+static volatile long s_host_vi_ticks;
+static volatile uint64_t s_host_vi_last;
+static long s_host_vi_seen;
+
+CORE_API void core_vsync(void) {
+    s_host_vi_last = host_time_ticks();
+    _InterlockedIncrement(&s_host_vi_ticks);
+    g_irq_pending = 1;
+}
+
 static void vi_update(void) {
-    uint64_t frame = host_time_ticks() / VI_FRAME_TICKS;
-    if (frame == s_vi_frame) return;
-    s_vi_frame = frame;
+    uint64_t now = host_time_ticks();
+    if (now - s_host_vi_last < TB_FREQ / 20) {
+        long t = s_host_vi_ticks;
+        if (t == s_host_vi_seen) return;
+        s_host_vi_seen = t;
+        s_vi_frame = now / VI_FRAME_TICKS;  // keep the timer in step for a later fallback
+    } else {
+        uint64_t frame = now / VI_FRAME_TICKS;
+        if (frame == s_vi_frame) return;
+        s_vi_frame = frame;
+        s_host_vi_seen = s_host_vi_ticks;
+    }
     for (int n = 0; n < 4; n++)
         if (shadow_read(0x2030 + 4 * n, 2) & 0x1000) s_vi_status |= 1u << n;
 }

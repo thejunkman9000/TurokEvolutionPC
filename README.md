@@ -59,11 +59,21 @@ Click in the window to capture the mouse; the mouse turns the view directly, lik
 | Menu navigation | arrow keys or W A S D | D-pad or left stick |
 | Fullscreen | F11 or Alt+Enter | |
 | Screenshot | F12 | |
+| Fast-forward (4x, while held) | Tab | |
 
 The modern layout applies while you control the player; in menus and cutscenes the buttons pass
 straight through (A/B/X/Y = A/B/X/Y). The game ships with *Invert Look* on, so the controller's right
 stick is flipped to make up look up; `--invert-look` keeps the game's inverted behaviour (or turn
 *Invert Look* off in Options > Control Setup > Advanced Options and pass `--invert-look`).
+
+Startup and speed:
+- The logos, legal screens and intro movie are skipped by default; the game starts at the main menu within a few
+  seconds. `--show-intro` plays them.
+- `--speed 2` runs the whole game at double speed; hold Tab to fast-forward 4x (sound is muted while sped up).
+
+Smoothness: the game runs at 60 fps. On a 60 Hz display its frames are paced by the display's refresh. On faster
+displays (120/144 Hz) mouse look still turns at the full refresh rate: each refresh redraws the latest game frame
+rotated by any mouse motion the game hasn't caught up with yet (only the world; the weapon and HUD stay put).
 
 Saves are written to `saves\GTKE51\Card A\` next to the executable, as `.gci` files that Dolphin can import.
 

@@ -45,11 +45,47 @@ void fatal(const char *fmt, ...) {
     ExitThread(1);  // stop the guest; the host stays up and reports the error
 }
 
-uint64_t host_time_ticks(void) {
+// Guest time runs at s_speed_milli/1000 of real time (core_set_speed: fast-forward).
+// It stays continuous across speed changes: guest = base_guest + (real - base_real) * speed.
+static SRWLOCK s_speed_lock = SRWLOCK_INIT;
+static uint64_t s_speed_base_real, s_speed_base_guest;
+static uint32_t s_speed_milli = 1000;
+
+static uint64_t real_ticks(void) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     uint64_t dt = (uint64_t)(now.QuadPart - s_qpc0.QuadPart);
     return (dt / s_qpf.QuadPart) * TB_FREQ + (dt % s_qpf.QuadPart) * TB_FREQ / s_qpf.QuadPart;
+}
+
+uint64_t host_time_ticks(void) {
+    uint64_t r = real_ticks();
+    AcquireSRWLockShared(&s_speed_lock);
+    uint64_t g = s_speed_milli == 1000 ? s_speed_base_guest + (r - s_speed_base_real)
+                                       : s_speed_base_guest + (r - s_speed_base_real) * s_speed_milli / 1000;
+    ReleaseSRWLockShared(&s_speed_lock);
+    return g;
+}
+
+static float s_speed_user = 1.f, s_speed_boost = 1.f;
+static void apply_speed(void);
+
+CORE_API void core_set_speed(float speed) { s_speed_user = speed; apply_speed(); }
+
+// Internal fast-forward (the intro skip runs the front end at boost speed).
+void core_speed_boost(float boost) { s_speed_boost = boost; apply_speed(); }
+
+static void apply_speed(void) {
+    float speed = s_speed_user * s_speed_boost;
+    uint32_t m = speed < 0.1f ? 100 : speed > 16.f ? 16000 : (uint32_t)(speed * 1000.f + 0.5f);
+    uint64_t r = real_ticks();
+    AcquireSRWLockExclusive(&s_speed_lock);
+    if (m != s_speed_milli) {
+        s_speed_base_guest += (r - s_speed_base_real) * s_speed_milli / 1000;
+        s_speed_base_real = r;
+        s_speed_milli = m;
+    }
+    ReleaseSRWLockExclusive(&s_speed_lock);
 }
 
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
@@ -148,6 +184,8 @@ CORE_API const uint8_t *core_ram(uint32_t *size) {
     if (size) *size = RAM_SIZE;
     return g_ram;
 }
+
+CORE_API float core_get_speed(void) { return s_speed_user * s_speed_boost; }
 
 CORE_API int core_state(char *msg, int msg_len) {
     if (msg && msg_len > 0) snprintf(msg, msg_len, "%s", s_fatal_msg);

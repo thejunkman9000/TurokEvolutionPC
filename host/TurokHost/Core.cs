@@ -76,6 +76,9 @@ internal unsafe struct CoreFrame
     public TevVertex* Vertices;
     public CoreTexture* Textures;
     public CoreMaterial* Materials;
+    public double LookYaw, LookPitch;  // mouse look consumed by this frame (radians, running totals)
+    public float LookPitchDeg;         // the frame's view pitch
+    public uint LookValid;             // 0: the player's view wasn't the camera
 }
 
 [System.Flags]
@@ -123,6 +126,16 @@ internal static unsafe partial class Core
     // Turn the first-person view directly: radians; +yaw = left, +pitch = up.
     [LibraryImport(Dll, EntryPoint = "core_mouse_look")]
     public static partial void MouseLook(float dyaw, float dpitch);
+
+    // Once per presented frame on a ~60 Hz display: paces the guest's retrace.
+    [LibraryImport(Dll, EntryPoint = "core_vsync")]
+    public static partial void VSync();
+
+    [LibraryImport(Dll, EntryPoint = "core_set_speed")]
+    public static partial void SetSpeed(float speed);
+
+    [LibraryImport(Dll, EntryPoint = "core_get_speed")]
+    public static partial float GetSpeed();
 
     // True while mouse look applies (on-foot first-person control).
     [LibraryImport(Dll, EntryPoint = "core_first_person")]

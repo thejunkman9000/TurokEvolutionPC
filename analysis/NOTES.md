@@ -286,3 +286,27 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
 2. Make the region 0x80146a00–0x80253ea0 a priority: work out where MSL ends and game code resumes.
 3. Build the recompiler: lift PPC to C, one function per symbol, with paired-single (Gekko) ops handled.
 4. Write the HLE layer to replace the SDK region: GX → D3D11/Vulkan, DVD → `supertree0.tre` and file reads, PAD → XInput, AI/AX → WASAPI.
+
+## Smooth mouse look, speed control, intro skip
+
+- **Why mouse look was choppy.** The game polls input and renders at 60 Hz with ±3 ms jitter, and the camera advances evenly per game frame (verified with the steady-turn self-test). The problems were all presentation:
+  - The guest's retrace came from a free-running 59.94 Hz timer that beat against the display.
+  - MonoGame's fixed timestep added duplicated and dropped presents.
+  - On a 144 Hz display, 60 fps frames are held for alternately 2 and 3 refreshes. The stats showed 10,600 repeated presents for 6,200 game frames.
+  - Mouse deltas were sampled once per host update via cursor warping.
+- **Fixes:**
+  - **Raw mouse input** (`host/TurokHost/RawMouse.cs`, WM_INPUT). Device counts accumulate between updates.
+  - **Display-paced retrace.** `IsFixedTimeStep = false`. On a ~60 Hz display the host calls `core_vsync()` after every present (every other one at ~120 Hz), and `vi_update` (hw.c) raises the retrace on those ticks. It falls back to the timer when no tick has arrived for 50 ms: other refresh rates, vsync off, or fast-forward.
+  - **View reprojection between game frames:**
+    - Each published frame carries a look stamp: the running total of mouse look consumed up to the poll that produced it, plus its view pitch. The stamp is queued when the game calls `GXCopyDisp` on the CPU side and popped by `publish_frame` on the GX thread.
+    - The host keeps the total it has sent. At every refresh it rotates the frame's world draws by the difference, yaw about world up and then pitch, using Rx(−p1)·Ry(−dy)·Rx(p0) in view space. The difference is capped at 0.15 rad, because the game frustum-culls and large offsets reveal gaps at the edges.
+    - Only full-screen perspective draws with some vertex farther than 2 units are rotated. The first-person weapon is drawn in view space at |z| < 0.6 and stays attached. The HUD is orthographic.
+    - Direction check: `TUROK_REPROJ_TEST=yaw,pitch`. Per-draw dump: `TUROK_BATCHINFO=<frame>` writes batchinfo.txt with projection, viewport and z range.
+- **Speed control.**
+  - `core_set_speed` scales guest time (`host_time_ticks`), keeping it continuous across changes, so timers, retrace and audio speed up together. The host mutes audio while sped up.
+  - `--speed X`; holding Tab gives 4x.
+- **Intro skip** (default; `--show-intro` disables).
+  - With `TUROK_SKIP_INTRO=frontendbackground`, the level loader swaps `bootupsequence` for the front-end background, which chains to the title screen.
+  - The front end runs at 4x until `mainmenu` loads.
+  - The PAD HLE taps Start ~1 s after the title screen loads.
+  - The main menu appears within a few seconds. Scripted test runs pass `TUROK_SKIP_INTRO=0` to keep the original boot timing.

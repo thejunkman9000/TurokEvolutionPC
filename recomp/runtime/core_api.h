@@ -101,6 +101,12 @@ typedef struct CoreFrame {
     const CoreVertex *vertices;
     const CoreTexture *textures;
     const CoreMaterial *materials;
+    // Mouse look consumed (radians, running totals as passed to core_mouse_look) by the
+    // game frame this was drawn from, and its view pitch in degrees; look_valid = 0
+    // when the player's view wasn't the camera. Lets the host reproject the frame.
+    double look_yaw, look_pitch;
+    float look_pitch_deg;
+    uint32_t look_valid;
 } CoreFrame;
 #pragma pack(pop)
 
@@ -134,3 +140,12 @@ CORE_API void core_mouse_look(float dyaw, float dpitch);
 // 1 while core_mouse_look applies (on-foot first-person control); 0 in flight
 // sections, cutscenes and menus, where the host falls back to C-stick emulation.
 CORE_API int core_first_person(void);
+
+// Display refresh: call once per presented frame on a ~60 Hz display so the guest's
+// retrace interrupt is paced by the display instead of a free-running timer.
+CORE_API void core_vsync(void);
+
+// Game speed multiplier (1 = normal; e.g. 4 = fast-forward). Scales the guest's clock,
+// so timers, retrace and audio all run faster; the game runs as fast as the CPU allows.
+CORE_API void core_set_speed(float speed);
+CORE_API float core_get_speed(void);  // effective speed, including the intro skip's fast-forward
