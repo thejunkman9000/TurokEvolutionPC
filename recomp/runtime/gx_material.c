@@ -90,11 +90,12 @@ uint32_t gx_material_build(CoreMaterial *m) {
 
         int use_map = en && s < nstages;
         m->stage[s][0] = use_map ? (float)map : -1.0f;
-        m->stage[s][1] = chan == 0 ? 0.0f : chan == 1 ? 1.0f : -1.0f;
+        m->stage[s][1] = chan == 0 ? 0.0f : chan == 1 ? 1.0f : chan == 5 ? 2.0f : chan == 6 ? 3.0f : -1.0f;
         m->stage[s][2] = (float)((ce >> 22) & 3);
         m->stage[s][3] = (float)((ae >> 22) & 3);
         m->swap[s][0] = (float)(ae & 3);
         m->swap[s][1] = (float)((ae >> 2) & 3);
+        m->swap[s][2] = (float)coord;  // stage texcoord (used by indirect ops)
 
         float kcol[3];
         konst_color(kc, kcol);
@@ -146,6 +147,53 @@ uint32_t gx_material_build(CoreMaterial *m) {
         m->fog_color[0] = ((col >> 16) & 0xFF) / 255.0f;
         m->fog_color[1] = ((col >> 8) & 0xFF) / 255.0f;
         m->fog_color[2] = (col & 0xFF) / 255.0f;
+    }
+    // ---- indirect texturing ----
+    {
+        uint32_t nind = (gen >> 16) & 7;
+        int any = 0;
+        for (int s = 0; s < 16; s++) {
+            uint32_t ic = gx_bp(0x10 + s);
+            m->ind_cmd0[s][0] = (float)(ic & 3);          // bt
+            m->ind_cmd0[s][1] = (float)((ic >> 2) & 3);   // fmt
+            m->ind_cmd0[s][2] = (float)((ic >> 4) & 7);   // bias
+            m->ind_cmd0[s][3] = (float)((ic >> 7) & 3);   // bump alpha
+            m->ind_cmd1[s][0] = (float)((ic >> 9) & 3);   // matrix index
+            m->ind_cmd1[s][1] = (float)((ic >> 11) & 3);  // matrix id
+            m->ind_cmd1[s][2] = (float)(((ic >> 13) & 7) * 8 + ((ic >> 16) & 7));  // wrap s, t
+            m->ind_cmd1[s][3] = (float)((ic >> 20) & 1);  // add previous
+            if (s < nstages && (ic & 0x1FFF80)) any = 1;  // matrix, wrap, addprev or bump alpha in use
+        }
+        for (int mi = 0; mi < 3; mi++) {
+            uint32_t a = gx_bp(0x06 + 3 * mi), b = gx_bp(0x07 + 3 * mi), c = gx_bp(0x08 + 3 * mi);
+            #define S11(v) ((float)((int32_t)((v) << 21) >> 21))
+            int scale = (int)(((a >> 22) & 3) | ((b >> 22) & 3) << 2 | ((c >> 22) & 3) << 4);
+            m->ind_mtx[2 * mi][0] = S11(a & 0x7FF);         m->ind_mtx[2 * mi][1] = S11(b & 0x7FF);
+            m->ind_mtx[2 * mi][2] = S11(c & 0x7FF);         m->ind_mtx[2 * mi][3] = (float)(17 - scale);
+            m->ind_mtx[2 * mi + 1][0] = S11((a >> 11) & 0x7FF); m->ind_mtx[2 * mi + 1][1] = S11((b >> 11) & 0x7FF);
+            m->ind_mtx[2 * mi + 1][2] = S11((c >> 11) & 0x7FF); m->ind_mtx[2 * mi + 1][3] = (float)(17 - scale);
+            #undef S11
+        }
+        uint32_t iref = gx_bp(0x27), ss0 = gx_bp(0x25), ss1 = gx_bp(0x26);
+        for (int i = 0; i < 4; i++) {
+            uint32_t ss = i < 2 ? ss0 : ss1, sh = (i & 1) * 8;
+            m->ind_stage[i][0] = (float)((iref >> (6 * i)) & 7);
+            m->ind_stage[i][1] = (float)((iref >> (6 * i + 3)) & 7);
+            m->ind_stage[i][2] = (float)((ss >> sh) & 15);
+            m->ind_stage[i][3] = (float)((ss >> (sh + 4)) & 15);
+        }
+        for (int t = 0; t < 8; t++) {
+            m->coord_size[t][0] = (float)((gx_bp(0x30 + 2 * t) & 0xFFFF) + 1);
+            m->coord_size[t][1] = (float)((gx_bp(0x31 + 2 * t) & 0xFFFF) + 1);
+        }
+        m->ind_misc[0] = (float)nind;
+        m->ind_misc[1] = (float)(any || nind);
+        // indirect stage texture maps are sampled too
+        for (uint32_t i = 0; i < nind; i++) {
+            uint32_t map = (iref >> (6 * i)) & 7;
+            if (!(used_maps & (1u << map))) { used_maps |= 1u << map; map_coord[map] = (iref >> (6 * i + 3)) & 7; }
+        }
+        for (int i = 0; i < 8; i++) m->map_coord[i / 4][i % 4] = (float)map_coord[i];
     }
     m->blend = gx_bp(0x41);
     m->zmode = gx_bp(0x40);

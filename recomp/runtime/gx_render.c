@@ -125,6 +125,8 @@ static void *grow(void *p, uint32_t *cap, uint32_t need, size_t elem) {
 static void slot_reset(FrameSlot *s) { s->nvtx = s->nbat = s->ntex = s->nmat = 0; }
 
 uint8_t *gx_tlut_mem(void) { return s_tmem_tlut; }
+static uint32_t s_tlut_gen;
+uint32_t gx_tlut_generation(void) { return s_tlut_gen; }
 // XF viewport Z scale/offset (window Z = ndc_z * scale + offset, 24-bit units)
 void gx_viewport_z(float *scale, float *offset) {
     memcpy(scale, &xf_reg[XF_VIEWPORT + 2], 4);
@@ -154,7 +156,25 @@ static uint32_t frame_material(const CoreMaterial *m) {
 
 void gx_texture_end_frame(void);
 
+// ---- statistics (logged once per second of guest time) -----------------------------------
+static struct { uint32_t frames, draws, lines, points, ind_draws, zcopies, tri_verts; } s_st;
+static uint64_t s_st_start;
+static void stats_frame(void) {
+    s_st.frames++;
+    uint64_t now = host_time_ticks();
+    if (!s_st_start) s_st_start = now;
+    if (now - s_st_start >= TB_FREQ) {
+        double secs = (double)(now - s_st_start) / TB_FREQ;
+        logf_("[stats] %.1f fps | per frame: %u draws, %u verts | lines %u points %u indirect %u zcopies %u (per s)",
+              s_st.frames / secs, s_st.frames ? s_st.draws / s_st.frames : 0, s_st.frames ? s_st.tri_verts / s_st.frames : 0,
+              s_st.lines, s_st.points, s_st.ind_draws, s_st.zcopies);
+        memset(&s_st, 0, sizeof s_st);
+        s_st_start = now;
+    }
+}
+
 static void publish_frame(void) {
+    stats_frame();
     FrameSlot *f = s_build;
     f->f.serial = ++s_serial;
     f->f.efb_width = 640; f->f.efb_height = 480;
@@ -176,6 +196,7 @@ void gx_texture_register_efb_copy(uint32_t addr, uint32_t id, uint32_t w, uint32
 uint32_t gx_tex_bytes(uint32_t fmt, uint32_t w, uint32_t h);
 
 static void efb_copy_to_texture(uint32_t v) {
+    if ((bp[0x43] & 7) == 3) s_st.zcopies++;  // PE_CONTROL pixel format Z24: copying depth
     uint32_t tl = bp[0x49], wh = bp[0x4A];
     int32_t x = tl & 0x3FF, y = (tl >> 10) & 0x3FF, w = (wh & 0x3FF) + 1, h = ((wh >> 10) & 0x3FF) + 1;
     uint32_t dst = ((bp[0x4B] & 0xFFFFFF) << 5) & 0x01FFFFFF;
@@ -239,6 +260,7 @@ void gx_bp_write(uint32_t v) {
         uint32_t tmem = (v & 0x3FF) << 9, bytes = ((v >> 10) & 0x7FF) * 32;
         if (tmem + bytes <= sizeof s_tmem_tlut)
             memcpy(s_tmem_tlut + tmem, gptr(0x80000000u | src, bytes, 0), bytes);
+        s_tlut_gen++;
         break;
     }
     default:
@@ -607,7 +629,12 @@ void gx_draw(uint8_t op, uint32_t count, const uint8_t *data) {
                   m[0], m[1], m[2], m[3]);
         }
     }
+    s_st.draws++;
+    if ((bp[0] >> 16) & 7) s_st.ind_draws++;  // GENMODE: number of indirect stages
+    if (prim == 5 || prim == 6) s_st.lines++;
+    if (prim == 7) s_st.points++;
     if (prim >= 5) return;  // lines / points: not drawn yet
+    s_st.tri_verts += count;
     static int s_only_vat = -2;
     if (s_only_vat == -2) { const char *e = getenv("TUROK_ONLY_VAT"); s_only_vat = e ? atoi(e) : -1; }
     if (s_only_vat >= 0 && vat != s_only_vat) return;

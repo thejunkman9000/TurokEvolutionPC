@@ -25,6 +25,13 @@ float4 Misc;          // logic op, stage count, debug view
 float4 Fog;           // a, c, b magnitude, b shift
 float4 FogMode;       // fsel, ortho, viewport z scale, z offset
 float4 FogColor;
+float4 IndCmd0[16];   // bt, fmt, bias, bump-alpha select
+float4 IndCmd1[16];   // matrix index, matrix id, wrap s*8 + wrap t, add previous
+float4 IndMtx[6];     // rows of the 3 indirect matrices; w = shift
+float4 IndStage[4];   // tex map, texcoord, s shift, t shift
+float4 CoordSize[8];  // setup-unit size per texcoord
+float4 IndMisc;       // number of indirect stages, indirect path enabled
+float4 TexSize[8];    // dimensions of each bound tex map
 
 Texture2D Tex0; sampler2D Samp0 = sampler_state { Texture = <Tex0>; };
 Texture2D Tex1; sampler2D Samp1 = sampler_state { Texture = <Tex1>; };
@@ -61,6 +68,18 @@ VSOut MainVS(VSIn i)
     o.T0 = i.T0; o.T1 = i.T1; o.T2 = i.T2; o.T3 = i.T3;
     o.T4 = i.T4; o.T5 = i.T5; o.T6 = i.T6; o.T7 = i.T7;
     return o;
+}
+
+float4 SampleMapGrad(int map, float2 uv, float2 dx, float2 dy)
+{
+    if (map == 0) return tex2Dgrad(Samp0, uv, dx, dy);
+    if (map == 1) return tex2Dgrad(Samp1, uv, dx, dy);
+    if (map == 2) return tex2Dgrad(Samp2, uv, dx, dy);
+    if (map == 3) return tex2Dgrad(Samp3, uv, dx, dy);
+    if (map == 4) return tex2Dgrad(Samp4, uv, dx, dy);
+    if (map == 5) return tex2Dgrad(Samp5, uv, dx, dy);
+    if (map == 6) return tex2Dgrad(Samp6, uv, dx, dy);
+    return tex2Dgrad(Samp7, uv, dx, dy);
 }
 
 float4 Swizzle(float4 v, float4 t)
@@ -147,6 +166,33 @@ float4 MainPS(VSOut i) : COLOR0
     if (Misc.z == 1.0) return float4((Stage[0].x >= 0.0 ? texs[(int)Stage[0].x] : float4(1, 0, 1, 1)).rgb, 1);
     if (Misc.z == 2.0) return float4(frac(i.T0), 0, 1);
     if (Misc.z == 3.0) return float4(i.C0.rgb, 1);
+    if (Misc.z == 5.0 && IndMisc.y != 0.0) return float4(1, 0, 1, 1);  // debug view 5: indirect draws
+
+    // ---- indirect texturing (GX fixed point: texel * 128) ----
+    bool indPath = IndMisc.y != 0.0;
+    int numInd = (int)IndMisc.x;
+    float2 duvdx[8], duvdy[8];
+    int2 fixuv[8];
+    int3 iindtex[4] = { int3(0, 0, 0), int3(0, 0, 0), int3(0, 0, 0), int3(0, 0, 0) };
+    [unroll] for (int q = 0; q < 8; q++)
+    {
+        duvdx[q] = ddx(uv[q]); duvdy[q] = ddy(uv[q]);
+        fixuv[q] = int2(uv[q] * CoordSize[q].xy * 128.0);
+    }
+    if (indPath)
+    {
+        for (int k = 0; k < numInd; k++)
+        {
+            int imap = (int)IndStage[k].x, icoord = (int)IndStage[k].y;
+            int2 tc = fixuv[icoord] >> int2(IndStage[k].zw);
+            float sc = 1.0 / exp2(IndStage[k].z);
+            float4 c = SampleMapGrad(imap, float2(tc) / (128.0 * TexSize[imap].xy),
+                                     duvdx[icoord] * sc, duvdy[icoord] * sc);
+            iindtex[k] = int3(round(c.abg * 255.0));
+        }
+    }
+    int2 tevcoord = int2(0, 0);
+    int alphabump = 0;
 
     float4 reg[4] = { Regs[0], Regs[1], Regs[2], Regs[3] };
     float4 result = reg[0];
@@ -158,8 +204,50 @@ float4 MainPS(VSOut i) : COLOR0
         float4 st = Stage[s];
         float4 sw = Swap[s];
         float4 tex = st.x >= 0.0 ? texs[(int)st.x] : float4(0, 0, 0, 0);
+        if (indPath)
+        {
+            float4 c0i = IndCmd0[s], c1i = IndCmd1[s];
+            int coord = (int)sw.z;
+            int bt = (int)c0i.x, fmt = (int)c0i.y, bias = (int)c0i.z, bs = (int)c0i.w;
+            int mi = (int)c1i.x, mid = (int)c1i.y;
+            int wrapS = (int)c1i.z / 8, wrapT = (int)c1i.z % 8;
+            bool hasInd = bt < numInd;
+            if (hasInd && bs != 0)
+            {
+                int ashift = fmt == 0 ? 0 : (fmt == 1 ? 5 : (fmt == 2 ? 4 : 3));
+                alphabump = (iindtex[bt][bs - 1] << ashift) & 248;
+            }
+            int2 trans = int2(0, 0);
+            if (hasInd && mi != 0)
+            {
+                int fshift = fmt == 0 ? 0 : (fmt == 1 ? 3 : (fmt == 2 ? 4 : 5));
+                int3 crd = iindtex[bt] >> fshift;
+                int badd = fmt == 0 ? -128 : 1;
+                if (bias & 1) crd.x += badd;
+                if (bias & 2) crd.y += badd;
+                if (bias & 4) crd.z += badd;
+                int r = 2 * (mi - 1);
+                if (mid == 0) trans = int2(dot(int3(IndMtx[r].xyz), crd), dot(int3(IndMtx[r + 1].xyz), crd)) >> 3;
+                else if (mid == 1) trans = (fixuv[coord] * crd.xx) >> 8;
+                else trans = (fixuv[coord] * crd.yy) >> 8;
+                int w = (int)IndMtx[r].w;
+                trans = w >= 0 ? (trans >> w) : (trans << (-w));
+            }
+            int2 wrapped;
+            wrapped.x = wrapS == 0 ? fixuv[coord].x : (wrapS >= 6 ? 0 : (fixuv[coord].x & (((256 >> (wrapS - 1)) << 7) - 1)));
+            wrapped.y = wrapT == 0 ? fixuv[coord].y : (wrapT >= 6 ? 0 : (fixuv[coord].y & (((256 >> (wrapT - 1)) << 7) - 1)));
+            tevcoord = c1i.w != 0.0 ? tevcoord + wrapped + trans : wrapped + trans;
+            tevcoord = (tevcoord << 8) >> 8;  // s24 wrap
+            if (st.x >= 0.0)
+            {
+                int map = (int)st.x;
+                tex = SampleMapGrad(map, float2(tevcoord) / (128.0 * TexSize[map].xy), duvdx[coord], duvdy[coord]);
+            }
+        }
         tex = Swizzle(tex, SwapTable[(int)sw.y]);
-        float4 ras = st.y == 0.0 ? i.C0 : (st.y == 1.0 ? i.C1 : float4(0, 0, 0, 0));
+        float ab = alphabump / 255.0, abn = (alphabump | (alphabump >> 5)) / 255.0;
+        float4 ras = st.y == 0.0 ? i.C0 : (st.y == 1.0 ? i.C1 : (st.y == 2.0 ? float4(ab, ab, ab, ab) :
+                     (st.y == 3.0 ? float4(abn, abn, abn, abn) : float4(0, 0, 0, 0))));
         ras = Swizzle(ras, SwapTable[(int)sw.x]);
         float4 k = Konst[s];
 

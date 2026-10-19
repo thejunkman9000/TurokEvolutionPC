@@ -52,6 +52,14 @@ typedef struct CoreMaterial {
     float fog[4];            // a, c, b_magnitude, b_shift
     float fog_mode[4];       // fsel (0 off, 2 linear, 4 exp, 5 exp2, 6 bexp, 7 bexp2), ortho, z scale, z offset
     float fog_color[4];      // rgb
+    // Indirect texturing (bump). Values follow the GX register fields.
+    float ind_cmd0[16][4];   // per TEV stage: bt (ind stage), fmt, bias, bump-alpha select
+    float ind_cmd1[16][4];   // per TEV stage: matrix index (0 off, 1-3), matrix id (0 static, 1 S, 2 T),
+                             //                wrap s * 8 + wrap t, add previous coord
+    float ind_mtx[6][4];     // 3 matrices x 2 rows: m0, m1, m2 (signed 11-bit), shift (17 - scale)
+    float ind_stage[4][4];   // per indirect stage: tex map, texcoord, s shift, t shift
+    float coord_size[8][4];  // per texcoord: setup-unit size (SU_SSIZE+1, SU_TSIZE+1)
+    float ind_misc[4];       // number of indirect stages, any stage uses an indirect op
 } CoreMaterial;
 
 typedef struct CoreBatch {

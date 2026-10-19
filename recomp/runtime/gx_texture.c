@@ -19,6 +19,12 @@ typedef struct TexEntry {
 } TexEntry;
 
 #define TEX_BUCKETS 4096
+uint32_t gx_tlut_generation(void);
+
+typedef struct TexEntry TexEntry;
+typedef struct { uint32_t frame, addr, fmt, w, h, levels, tlut, tlut_gen; TexEntry *entry; } MemoSlot;
+#define MEMO_SLOTS 1024
+static MemoSlot s_memo[MEMO_SLOTS];
 static TexEntry *s_tex[TEX_BUCKETS];
 static uint32_t s_next_id = 1, s_frame_counter;
 
@@ -124,7 +130,7 @@ static uint64_t hash_bytes(const uint8_t *p, uint32_t n, uint64_t h) {
 // Copies stay on the host GPU (as in Dolphin's EFB-copy-to-texture). A texture
 // read at a copy's destination returns a reference to it, as long as the CPU
 // hasn't since rewritten that memory (detected by hashing it at copy time).
-typedef struct { uint32_t addr, id, w, h, bytes; uint64_t hash; } EfbCopy;
+typedef struct { uint32_t addr, id, w, h, bytes, checked_frame; uint64_t hash; } EfbCopy;
 static EfbCopy s_copies[64];
 static int s_ncopies;
 
@@ -132,7 +138,7 @@ void gx_texture_register_efb_copy(uint32_t addr, uint32_t id, uint32_t w, uint32
     EfbCopy *c = NULL;
     for (int i = 0; i < s_ncopies; i++) if (s_copies[i].addr == addr) c = &s_copies[i];
     if (!c) { if (s_ncopies == 64) s_ncopies = 0; c = &s_copies[s_ncopies++]; }
-    c->addr = addr; c->id = id; c->w = w; c->h = h; c->bytes = bytes;
+    c->addr = addr; c->id = id; c->w = w; c->h = h; c->bytes = bytes; c->checked_frame = 0;
     c->hash = addr + bytes <= RAM_SIZE ? hash_bytes(g_ram + addr, bytes, 0) : 0;
 }
 
@@ -140,10 +146,13 @@ static int efb_copy_lookup(uint32_t addr, CoreTexture *out) {
     for (int i = 0; i < s_ncopies; i++) {
         EfbCopy *c = &s_copies[i];
         if (c->addr != addr) continue;
-        if (c->addr + c->bytes <= RAM_SIZE && hash_bytes(g_ram + c->addr, c->bytes, 0) != c->hash) {
+        // verify the memory is untouched at most once per frame (the shadow map is read thousands of times)
+        if (c->checked_frame != s_frame_counter + 1 && c->addr + c->bytes <= RAM_SIZE &&
+            hash_bytes(g_ram + c->addr, c->bytes, 0) != c->hash) {
             c->addr = 0xFFFFFFFFu;  // CPU wrote a real texture here
             return 0;
         }
+        c->checked_frame = s_frame_counter + 1;
         out->id = c->id; out->width = c->w; out->height = c->h; out->levels = 1; out->rgba = NULL;
         return 1;
     }
@@ -189,6 +198,19 @@ int gx_texture_for_map(int map, CoreTexture *out) {
     }
     if (addr + bytes > RAM_SIZE) return 0;
     const uint8_t *src = g_ram + addr;
+    // Per-frame memo: hashing the whole texture on every draw (thousands per frame)
+    // dominated the guest thread. Within one frame a texture is hashed once; palette
+    // textures also key on the TLUT load generation.
+    uint32_t tlut_gen = (fmt >= 8 && fmt <= 10) ? gx_tlut_generation() : 0;
+    uint32_t mk = (addr >> 5) * 2654435761u ^ fmt * 97u ^ w * 131u ^ h * 137u ^ levels * 139u ^ tlut * 149u ^ tlut_gen * 151u;
+    MemoSlot *ms = &s_memo[mk % MEMO_SLOTS];
+    if (ms->frame == s_frame_counter + 1 && ms->addr == addr && ms->fmt == fmt && ms->w == w && ms->h == h &&
+        ms->levels == levels && ms->tlut == tlut && ms->tlut_gen == tlut_gen) {
+        TexEntry *me = ms->entry;
+        me->last_used = s_frame_counter;
+        out->id = me->id; out->width = w; out->height = h; out->levels = levels; out->rgba = me->rgba;
+        return 1;
+    }
     uint64_t hash = hash_bytes(src, bytes, 0xCBF29CE484222325ull ^ fmt ^ ((uint64_t)w << 32 | h) ^ ((uint64_t)levels << 56));
     if (fmt >= 8 && fmt <= 10) {
         uint32_t tmem = (tlut & 0x3FF) << 9, pal_bytes = fmt == 8 ? 32 : fmt == 9 ? 512 : 0x8000;
@@ -215,6 +237,8 @@ int gx_texture_for_map(int map, CoreTexture *out) {
         e->next = s_tex[bucket]; s_tex[bucket] = e;
     }
     e->last_used = s_frame_counter;
+    ms->frame = s_frame_counter + 1; ms->addr = addr; ms->fmt = fmt; ms->w = w; ms->h = h;
+    ms->levels = levels; ms->tlut = tlut; ms->tlut_gen = tlut_gen; ms->entry = e;
     out->id = e->id; out->width = w; out->height = h; out->levels = levels; out->rgba = e->rgba;
     return 1;
 }
@@ -228,7 +252,10 @@ void gx_texture_end_frame(void) {
         TexEntry **pp = &s_tex[b];
         while (*pp) {
             TexEntry *e = *pp;
-            if (s_frame_counter - e->last_used > 600) { *pp = e->next; free(e->rgba); free(e); }
+            if (s_frame_counter - e->last_used > 600) {
+                for (int m = 0; m < MEMO_SLOTS; m++) if (s_memo[m].entry == e) s_memo[m].frame = 0;
+                *pp = e->next; free(e->rgba); free(e);
+            }
             else pp = &e->next;
         }
     }

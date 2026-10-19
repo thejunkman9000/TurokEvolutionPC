@@ -13,7 +13,7 @@ namespace TurokHost;
 internal sealed class TurokGame : Game
 {
     private const int EfbWidth = 640, EfbHeight = 480;
-    private const int RenderScale = 2;
+    private readonly int RenderScale;  // internal resolution = 640x480 * RenderScale
 
     private readonly GraphicsDeviceManager _graphics;
     private readonly string _isoPath;
@@ -25,6 +25,7 @@ internal sealed class TurokGame : Game
     private Texture2D? _white;
     // EFB-to-texture copies, by copy id (persist across frames like the game's textures)
     private readonly Dictionary<uint, RenderTarget2D> _efbCopies = new();
+    private readonly Vector4[] _texSize = new Vector4[8];
 
     // Last frame copied out of the core (redrawn until a newer one arrives).
     private TevVertex[] _vertices = Array.Empty<TevVertex>();
@@ -43,6 +44,7 @@ internal sealed class TurokGame : Game
     private const int AudioChunkFrames = 1600;  // 50 ms at 32 kHz
 
     private string _status = "starting";
+    private bool _fullscreenKeyHeld;
     private readonly float _debugView = float.TryParse(Environment.GetEnvironmentVariable("TUROK_DEBUG_VIEW"), out var dv) ? dv : 0;
     private readonly List<int> _screenshotFrames = new();
     private bool _screenshotPending;
@@ -71,20 +73,28 @@ internal sealed class TurokGame : Game
         public readonly Vector4[] ColorOp = new Vector4[16], AlphaOp = new Vector4[16];
         public readonly Vector4[] Stage = new Vector4[16], Swap = new Vector4[16], Konst = new Vector4[16];
         public readonly Vector4[] SwapTable = new Vector4[4], Regs = new Vector4[4], MapCoord = new Vector4[2];
-        public Vector4 AlphaTest, Misc, Fog, FogMode, FogColor;
+        public Vector4 AlphaTest, Misc, Fog, FogMode, FogColor, IndMisc;
+        public readonly Vector4[] IndCmd0 = new Vector4[16], IndCmd1 = new Vector4[16], IndMtx = new Vector4[6];
+        public readonly Vector4[] IndStage = new Vector4[4], CoordSize = new Vector4[8];
         public BlendState Blend = BlendState.Opaque;
         public DepthStencilState Depth = DepthStencilState.None;
         public uint Cull;
     }
 
-    public TurokGame(string isoPath)
+    public sealed record Options(int Scale = 2, bool Fullscreen = false, bool VSync = true);
+
+    public TurokGame(string isoPath, Options? options = null)
     {
+        options ??= new Options();
         _isoPath = isoPath;
+        RenderScale = Math.Clamp(options.Scale, 1, 4);
         _graphics = new GraphicsDeviceManager(this)
         {
             PreferredBackBufferWidth = 1280,
             PreferredBackBufferHeight = 960,
-            SynchronizeWithVerticalRetrace = true,
+            SynchronizeWithVerticalRetrace = options.VSync,
+            HardwareModeSwitch = false,  // borderless fullscreen
+            IsFullScreen = options.Fullscreen,
             GraphicsProfile = GraphicsProfile.HiDef,
         };
         IsMouseVisible = true;
@@ -146,10 +156,15 @@ internal sealed class TurokGame : Game
         var kb = Keyboard.GetState();
         var gp = GamePad.GetState(PlayerIndex.One);
         if (kb.IsKeyDown(Keys.F12)) _screenshotPending = true;
+        bool toggle = kb.IsKeyDown(Keys.F11) ||
+                      (kb.IsKeyDown(Keys.Enter) && (kb.IsKeyDown(Keys.LeftAlt) || kb.IsKeyDown(Keys.RightAlt)));
+        if (toggle && !_fullscreenKeyHeld && IsActive) _graphics.ToggleFullScreen();
+        _fullscreenKeyHeld = toggle;
+        bool altHeld = kb.IsKeyDown(Keys.LeftAlt) || kb.IsKeyDown(Keys.RightAlt);
 
         PadButtons b = 0;
         void Map(bool down, PadButtons button) { if (down) b |= button; }
-        Map(kb.IsKeyDown(Keys.Enter) || gp.Buttons.Start == ButtonState.Pressed, PadButtons.Start);
+        Map((kb.IsKeyDown(Keys.Enter) && !altHeld) || gp.Buttons.Start == ButtonState.Pressed, PadButtons.Start);
         Map(kb.IsKeyDown(Keys.Space) || gp.Buttons.A == ButtonState.Pressed, PadButtons.A);
         Map(kb.IsKeyDown(Keys.LeftShift) || gp.Buttons.B == ButtonState.Pressed, PadButtons.B);
         Map(kb.IsKeyDown(Keys.E) || gp.Buttons.X == ButtonState.Pressed, PadButtons.X);
@@ -238,8 +253,9 @@ internal sealed class TurokGame : Game
 
     protected override void OnExiting(object sender, ExitingEventArgs args)
     {
-        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "audio_stats.txt"),
-            $"rate {_soundRate} submitted {_audioSubmitted} buffers ({_audioSubmitted * AudioChunkFrames / (double)Math.Max(1, _soundRate):F1} s), starved updates {_audioStarved}\n");
+        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "host_stats.txt"),
+            $"audio: rate {_soundRate} submitted {_audioSubmitted} buffers ({_audioSubmitted * AudioChunkFrames / (double)Math.Max(1, _soundRate):F1} s), starved updates {_audioStarved}\n" +
+            $"draw: {_drawCount} calls, avg {_drawMsTotal / Math.Max(1, _drawCount):F2} ms, max {_drawMsMax:F1} ms; game frames received {_framesReceived}\n");
         base.OnExiting(sender, args);
     }
 
@@ -319,6 +335,9 @@ internal sealed class TurokGame : Game
         p.Fog = new Vector4(m->Fog[0], m->Fog[1], m->Fog[2], m->Fog[3]);
         p.FogMode = new Vector4(m->FogMode[0], m->FogMode[1], m->FogMode[2], m->FogMode[3]);
         p.FogColor = new Vector4(m->FogColor[0], m->FogColor[1], m->FogColor[2], 1);
+        Copy(m->IndCmd0, p.IndCmd0); Copy(m->IndCmd1, p.IndCmd1); Copy(m->IndMtx, p.IndMtx);
+        Copy(m->IndStage, p.IndStage); Copy(m->CoordSize, p.CoordSize);
+        p.IndMisc = new Vector4(m->IndMisc[0], m->IndMisc[1], m->IndMisc[2], m->IndMisc[3]);
         p.Blend = BlendFor(m->Blend);
         p.Depth = DepthFor(m->ZMode);
         p.Cull = m->Cull;
@@ -554,7 +573,21 @@ internal sealed class TurokGame : Game
         new() { CullMode = CullFlip ? CullMode.CullCounterClockwiseFace : CullMode.CullClockwiseFace, ScissorTestEnable = true },
     };
 
+    private readonly System.Diagnostics.Stopwatch _drawWatch = new();
+    private double _drawMsTotal, _drawMsMax;
+    private int _drawCount;
+
     protected override void Draw(GameTime gameTime)
+    {
+        _drawWatch.Restart();
+        DrawFrame();
+        // Measure GPU-submission cost of our own drawing (excludes vsync wait in Present).
+        double ms = _drawWatch.Elapsed.TotalMilliseconds;
+        _drawMsTotal += ms; _drawMsMax = Math.Max(_drawMsMax, ms); _drawCount++;
+        base.Draw(gameTime);
+    }
+
+    private void DrawFrame()
     {
         PullFrame();
         var gd = GraphicsDevice;
@@ -583,13 +616,22 @@ internal sealed class TurokGame : Game
             P["SwapTable"].SetValue(m.SwapTable); P["Regs"].SetValue(m.Regs); P["MapCoord"].SetValue(m.MapCoord);
             P["AlphaTest"].SetValue(m.AlphaTest);
             P["Fog"].SetValue(m.Fog); P["FogMode"].SetValue(m.FogMode); P["FogColor"].SetValue(m.FogColor);
+            P["IndMisc"].SetValue(m.IndMisc);
+            if (m.IndMisc.Y != 0)
+            {
+                P["IndCmd0"].SetValue(m.IndCmd0); P["IndCmd1"].SetValue(m.IndCmd1); P["IndMtx"].SetValue(m.IndMtx);
+                P["IndStage"].SetValue(m.IndStage); P["CoordSize"].SetValue(m.CoordSize);
+            }
             P["Misc"].SetValue(new Vector4(m.Misc.X, m.Misc.Y, _debugView, 0));
             for (int t = 0; t < 8; t++)
             {
                 Texture2D? tex = b.Textures[t];
                 if (b.CopyRefs[t] != 0) tex = _efbCopies.TryGetValue(b.CopyRefs[t], out var rt) ? rt : null;
-                P["Tex" + t].SetValue(tex ?? _white);
+                var bound = tex ?? _white;
+                P["Tex" + t].SetValue(bound);
+                _texSize[t] = new Vector4(bound.Width, bound.Height, 0, 0);
             }
+            P["TexSize"].SetValue(_texSize);
 
             fx.CurrentTechnique.Passes[0].Apply();
             for (int t = 0; t < 8; t++) gd.SamplerStates[t] = b.Samplers[t];
@@ -633,6 +675,5 @@ internal sealed class TurokGame : Game
             if (scheduled && _screenshotFrames.Count == 0 && Environment.GetEnvironmentVariable("TUROK_EXIT_AFTER_SCREENSHOT") == "1")
                 Exit();
         }
-        base.Draw(gameTime);
     }
 }

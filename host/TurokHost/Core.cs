@@ -40,6 +40,7 @@ internal unsafe struct CoreMaterial
     public fixed float AlphaTest[4], Misc[4];
     public uint Blend, ZMode, Cull, Reserved;
     public fixed float Fog[4], FogMode[4], FogColor[4];
+    public fixed float IndCmd0[64], IndCmd1[64], IndMtx[24], IndStage[16], CoordSize[32], IndMisc[4];
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 4)]

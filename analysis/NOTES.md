@@ -135,8 +135,18 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
 - **Locked-cache DMA** (SPRs 922/923, with a physical memory address) is emulated. The THP video decoder needs it; without it the intro movie and credits video decoded to garbage.
 - The intro movie now plays (after boot, and after New Game), so scripted menu input needs a Start press to skip it, and menu timing varies between runs.
 - Soak test: 4¾ minutes of scripted play (walking, combat with damage taken, menus) with no crashes and no audio starvation.
+- **Performance:** level 1 went from 14 fps to about 40 fps (the game's target is 30).
+  - The profiler showed 63% of the guest thread in `gx_texture_for_map`, hashing whole textures on every draw.
+  - Texture lookups are now memoized per frame, with a TLUT-load generation counter for palette textures, and EFB copies are verified once per frame.
+  - Profiling: `TUROK_PROFILE=<start s>,<duration s>` logs the top self and inclusive functions of the guest thread. A `[stats]` line each second reports fps, draws and vertices per frame, and line/point, indirect and Z-copy usage.
+  - Host draw cost is about 0.6 ms per frame; `host_stats.txt` is written on exit.
+- **Indirect texturing (bump)** follows Dolphin's integer semantics:
+  - Indirect stages are sampled at shifted coordinates, then each stage's format, bias and bump alpha are applied, followed by the static or S/T-dynamic matrices and the wrap/add-previous steps, with s24 wrap.
+  - Stages sample with explicit gradients. Setup-unit texcoord sizes come from BP 0x30+.
+  - Used by about 25 draws per frame in level 1 (the river by the bridge). Not visually verified yet. `TUROK_DEBUG_VIEW=5` shows indirect draws in magenta.
+- **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--no-vsync]`. F11 or Alt+Enter toggles borderless fullscreen.
 - Known gaps:
-  - Indirect texturing (bump), lines and points.
+  - Lines and points (not used in level 1).
   - Z-buffer EFB copies.
   - Range-adjusted fog.
   - Audio: no polyphase resampling (it needs the DSP ROM coefficients; linear is used instead), no initial time delay (ITD), and no DVD streaming audio (AI streaming is untested).
