@@ -146,7 +146,7 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - Used by about 25 draws per frame in level 1 (the river by the bridge). Not visually verified yet. `TUROK_DEBUG_VIEW=5` shows indirect draws in magenta.
 - **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--widescreen] [--no-vsync] [--level <atr path>]`. F11 or Alt+Enter toggles borderless fullscreen.
 - **Widescreen:** the EFB is 854 wide. Perspective draws whose viewport spans the full 640 width are stretched across it, with the projection's X row scaled by 640/854. Every other draw, and any EFB copy narrower than full width (such as the shadow map), stays 4:3 and is shifted to the center.
-- **Mouse look:** click inside the window to capture the mouse, Esc to release. Motion turns the view directly through `core_mouse_look`, not through the C-stick. Left/right buttons map to R/L. `--mouse-sens X` scales it (0.0022 rad/pixel at 1).
+- **Mouse look:** click inside the window to capture the mouse, Esc to release. Motion turns the view directly through `core_mouse_look` (yaw and pitch are written on the player's view actor), not through the C-stick. Left/right buttons map to R/L. `--mouse-sens X` scales it (0.0022 rad/pixel at 1).
   - The game's own stick turning is unusable for a mouse. Measured by overriding the value GetAxisX returns:
     - Yaw: dead zone up to 0.3 normalized. 0.5 → 0.0075, 0.75 → 0.020, 1.0 → 0.052 rad/frame (≈180°/s max). 2 frames of latency, then a ~5-frame ramp.
     - Pitch (raw C-stick Y): dead zone up to raw 35. Raw 36-61 → 0.0012-0.0084 rad/frame, then a jump to a fast speed of 0.028-0.034 rad/frame from raw 64. 3 frames of latency, then a ramp.
@@ -154,11 +154,16 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
     - The rendered camera yaw is actor yaw − π. The game derives +0xC4 and the camera from it.
     - Found by snapshotting RAM during a steady scripted turn, keeping floats whose deltas match the rendered yaw deltas, then poking each candidate. Only actor+0xF0 moved the camera.
     - Several other actors keep copies at +0xC4/+0xF0. Actor +0xEC is body pitch (writing it tilts the player model), not look pitch.
-  - **Pitch has no scalar state.** It ends up as a bone rotation in the player's skeleton (0x8068xxxx animation data); group pokes there move it, single fields don't.
-    - The camera basis in the player object (`*(0x80310E28)`: +0x2188 forward, +0x2194 up) is recomputed every frame.
-    - So pitch is a closed loop through the game's own C-stick Y: the mouse moves a target pitch, and each frame `hle_look.c` picks the raw stick value from the measured curve. It predicts the 3 frames in flight, with gain 0.6, and dithers between the slow and fast speeds.
-    - Self-test (`TUROK_MOUSETEST=<frames>`): a +0.3 rad step settles to 0.299 in ~20 frames, and a 0.01 rad/frame drag trails by ~5 frames.
-    - The loop hands control back (no override) when settled or when the controller's C-stick Y is in use.
+  - **Pitch is written directly too:** view actor +0x41C is the look pitch in **degrees** (positive = up), clamped by the game to ±70° (= ±1.222 rad).
+    - Found by tracing code, not RAM: the per-frame player look update `fn_801BB0A8` (called from `fn_801B929C`) takes the look axes the input events store at player +0x19D8/+0x19DC (Y) and +0x19E0/+0x19E4 (X).
+      - It applies the 0.3 dead zone and rescale, squares the value (`fn_801BAA28`), smooths it 20% per frame into +0x458/+0x45C (previous values at +0x460/+0x464; this is the ramp), then calls `fn_801BAB44` (yaw: adds to +0xF0) and `fn_801BAD84` (pitch).
+      - `fn_801BAD84` adds `look Y × speed (+0x92C × 0.5) × dt × sensitivity level` to +0x41C, applies the invert-Y option, and clamps to ±70 (constant at 0x802800BC). +0x420 is a second angle clamped to ±45.
+      - Options struct at player +0x3CC: +0x4 selects a spring/absolute mode (+0x41C is lerped toward 70 × stick instead of integrated, so mouse pitch would drift back there; it is 0 by default), +0x14 invert Y, +0x18/+0x1C X/Y sensitivity levels.
+    - The actor-script query `fn_800C4240` (ids 0x1F-0x22 = main X/Y, C-stick X/Y) is not on the player's look path. It is only reached through the animation-controller driver `fn_800CBC58`, and was never called for those ids during gameplay.
+    - The earlier RAM search and the group pokes in the 0x8068xxxx skeleton region missed +0x41C. The skeleton pokes most likely moved pitch through bones derived from it.
+    - `hle_look.c` adds the mouse delta (converted to degrees) and clamps, at the C-stick poll before the player update. The game's own stick integration still runs on top, so gamepad look keeps working (checked with a scripted `CY+`/`CY-`). The old closed loop through C-stick Y, and the `g_cy_override` hook in PADRead, are gone.
+    - Self-test (`TUROK_MOUSETEST=2700`): yaw +0.5 → 0.500 after 3 frames. Pitch +0.3 step → 0.300 on the next frame (actor 17.19°), exact from then on. A −0.01 rad/frame drag is exact every frame (−0.050 at 5, −0.300 at 30), with no trailing. +2/−4 rad steps clamp at ±1.222. The old loop needed ~20 frames to settle a step and trailed a drag by ~5 frames.
+    - `TUROK_MOUSETEST` counts C-stick polls in first person, which run ahead of the host frame counter, so the screenshot frame must be well past 2700 (5600 works with the standard New Game input script). Delete `saves/` before scripted runs: with a save present, the same input script ends up in the credits.
   - The rendered camera's forward vector is cached at 0x802E22F8 (x, y, z; y up): yaw = atan2(x, z), pitch = atan2(y, |xz|). Writes happen only while actor yaw − π matches it, so cutscenes and other cameras are untouched.
   - Input plumbing found on the way:
     - PADStatus array at 0x802CC718.

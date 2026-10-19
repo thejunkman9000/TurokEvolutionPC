@@ -11,7 +11,6 @@
 
 typedef struct { uint16_t buttons; int8_t sx, sy, cx, cy; uint8_t l, r; } PadState;
 extern PadState g_pads[4];
-extern int g_cy_override;
 
 #define PAD_ERR_NONE 0
 #define PAD_ERR_NO_CONTROLLER -1
@@ -27,7 +26,7 @@ void SYM_PADRead(PPCContext *c) {
         wr8(p + 2, (uint8_t)s.sx);
         wr8(p + 3, (uint8_t)s.sy);
         wr8(p + 4, (uint8_t)s.cx);
-        wr8(p + 5, (uint8_t)(g_cy_override >= -128 && g_cy_override <= 127 ? g_cy_override : s.cy));
+        wr8(p + 5, (uint8_t)s.cy);
         wr8(p + 6, s.l);
         wr8(p + 7, s.r);
         wr8(p + 8, (s.buttons & 0x0100) ? 0xFF : 0);  // analog A
