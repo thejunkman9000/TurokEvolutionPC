@@ -20,3 +20,4 @@ void gx_pe_finish(void);
 void gx_pe_token(uint16_t token, int interrupt);
 void gx_cp_reg_written(uint32_t off);      // after a CP MMIO register write (0xCC0000xx)
 void gx_gather_reset(void);                // mtspr WPAR
+int gx_fifo_idle(void);                    // GPU thread has parsed everything sent so far

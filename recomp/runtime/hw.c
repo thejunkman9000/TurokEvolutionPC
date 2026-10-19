@@ -329,22 +329,28 @@ static void vi_update(void) {
 // 0x100A: bit0 token enable, bit1 finish enable, bit2 token status,
 //         bit3 finish status (status bits are write-1-to-clear). 0x100E: token.
 // ============================================================================
-static uint16_t s_pe_ctrl, s_pe_token;
+// The FIFO parser runs on its own thread (gx_fifo.c), so the status bits it
+// raises and the guest's write-1-to-clear are updated atomically.
+static volatile long s_pe_ctrl, s_pe_token;
 
-void gx_pe_finish(void) { s_pe_ctrl |= 8; g_irq_pending = 1; }
+void gx_pe_finish(void) { _InterlockedOr(&s_pe_ctrl, 8); g_irq_pending = 1; }
 void gx_pe_token(uint16_t token, int interrupt) {
     s_pe_token = token;
-    if (interrupt) { s_pe_ctrl |= 4; g_irq_pending = 1; }
+    if (interrupt) { _InterlockedOr(&s_pe_ctrl, 4); g_irq_pending = 1; }
 }
 
 static int pe_read(uint32_t off, int size, uint32_t *out) {
-    if (off == 0x100A && size == 2) { *out = s_pe_ctrl; return 1; }
-    if (off == 0x100E && size == 2) { *out = s_pe_token; return 1; }
+    if (off == 0x100A && size == 2) { *out = (uint16_t)s_pe_ctrl; return 1; }
+    if (off == 0x100E && size == 2) { *out = (uint16_t)s_pe_token; return 1; }
     return 0;
 }
 static int pe_write(uint32_t off, uint32_t v, int size) {
     if (off == 0x100A && size == 2) {
-        s_pe_ctrl = (uint16_t)((s_pe_ctrl & 0xC & ~(v & 0xC)) | (v & 3));
+        long old, nv;
+        do {
+            old = s_pe_ctrl;
+            nv = (long)((old & 0xC & ~(v & 0xC)) | (v & 3));
+        } while (_InterlockedCompareExchange(&s_pe_ctrl, nv, old) != old);
         return 1;
     }
     return 0;
@@ -445,7 +451,7 @@ int hw_read(uint32_t off, int size, uint32_t *out) {
     if (off >= 0x2000 && off < 0x2100) return vi_read(off, size, out);
     if (off >= 0x3000 && off < 0x3100) return pi_read(off, size, out);
     if (off >= 0x1000 && off < 0x1100) return pe_read(off, size, out);
-    if (off == 0x0000 && size == 2) { *out = (shadow_read(0, 2) & ~0x1Fu) | 0x0C; return 1; }  // CP status: GP idle
+    if (off == 0x0000 && size == 2) { *out = (shadow_read(0, 2) & ~0x1Fu) | (gx_fifo_idle() ? 0x0C : 0); return 1; }  // CP status: GP idle
     if (off >= 0x6000 && off < 0x6028 && size == 4) return di_read(off, out);
     if (off >= 0x6C00 && off < 0x6C10 && size == 4) return ai_read(off, out);
     return 0;
