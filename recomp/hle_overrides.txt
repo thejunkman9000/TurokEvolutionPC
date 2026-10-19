@@ -32,3 +32,6 @@ CARDSetStatus
 
 # Level loading (logged; TUROK_LEVEL redirects the first level): runtime/hle_level.c.
 80019700  # level load by .atr path
+
+# Mouse look: applied once per frame at the C-stick poll (GetAxisX): runtime/hle_look.c.
+80007734  # GetAxisX(port, id)

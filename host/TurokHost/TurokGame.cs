@@ -54,9 +54,12 @@ internal sealed class TurokGame : Game
     // Mouse look: click in the window to capture the mouse, Esc to release.
     private bool _mouseCaptured;
     private bool _wasActive, _prevLeftDown, _swallowClick;
-    private const float MouseSensitivity = 0.06f;  // stick deflection per pixel per update
+    private const float MouseRadiansPerPixel = 0.0022f;  // at --mouse-sens 1
+    private readonly float _mouseRadPerPixel;
     private readonly float _debugView = float.TryParse(Environment.GetEnvironmentVariable("TUROK_DEBUG_VIEW"), out var dv) ? dv : 0;
     private readonly List<int> _screenshotFrames = new();
+    private readonly List<int> _ramDumpFrames = new();
+    private readonly List<(int frame, uint addr, float add)> _pokes = new();
     private bool _screenshotPending;
     private readonly List<(int Frame, PadButtons Button, int Hold)> _script = new();
     private readonly List<(int Frame, string Axis, int Hold)> _stickScript = new();
@@ -91,11 +94,13 @@ internal sealed class TurokGame : Game
         public uint Cull;
     }
 
-    public sealed record Options(int Scale = 2, bool Fullscreen = false, bool VSync = true, bool Widescreen = false);
+    public sealed record Options(int Scale = 2, bool Fullscreen = false, bool VSync = true, bool Widescreen = false,
+                                 float MouseSensitivity = 1f);
 
     public TurokGame(string isoPath, Options? options = null)
     {
         options ??= new Options();
+        _mouseRadPerPixel = MouseRadiansPerPixel * options.MouseSensitivity;
         _isoPath = isoPath;
         RenderScale = Math.Clamp(options.Scale, 1, 4);
         EfbWidth = options.Widescreen ? 854 : 640;
@@ -117,6 +122,17 @@ internal sealed class TurokGame : Game
         // one if TUROK_EXIT_AFTER_SCREENSHOT=1).
         foreach (var part in (Environment.GetEnvironmentVariable("TUROK_SCREENSHOT") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
             if (int.TryParse(part, out var n)) _screenshotFrames.Add(n);
+        // TUROK_RAMDUMP=f1,f2,...: write guest RAM to ram_<frame>.bin at those frames (debugging).
+        foreach (var part in (Environment.GetEnvironmentVariable("TUROK_RAMDUMP") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
+            if (int.TryParse(part, out var n)) _ramDumpFrames.Add(n);
+        // TUROK_POKE=frame:hexaddr:delta,...: add delta to the big-endian float at addr (debugging).
+        foreach (var part in (Environment.GetEnvironmentVariable("TUROK_POKE") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var f = part.Split(':');
+            if (f.Length == 3 && int.TryParse(f[0], out var pf) && uint.TryParse(f[1], System.Globalization.NumberStyles.HexNumber, null, out var pa) &&
+                float.TryParse(f[2], System.Globalization.CultureInfo.InvariantCulture, out var pd))
+                _pokes.Add((pf, pa, pd));
+        }
         // TUROK_INPUT=frame:Button[:holdFrames],...  e.g. "150:Down:4,200:A:6".
         // Sticks: LX+ LX- LY+ LY- (main) and CX+ CX- CY+ CY- (C-stick) at full deflection.
         foreach (var part in (Environment.GetEnvironmentVariable("TUROK_INPUT") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
@@ -218,8 +234,12 @@ internal sealed class TurokGame : Game
         float mdx = 0, mdy = 0;
         if (_mouseCaptured)
         {
-            mdx = (mouse.X - center.X) * MouseSensitivity;
-            mdy = -(mouse.Y - center.Y) * MouseSensitivity;
+            // Raw mouse motion turns the view directly (core_mouse_look), like a PC shooter:
+            // right turns right (negative yaw), up looks up (positive pitch).
+            float k = _mouseRadPerPixel;
+            mdx = (mouse.X - center.X) * k;
+            mdy = (mouse.Y - center.Y) * k;
+            if (mdx != 0 || mdy != 0) Core.MouseLook(-mdx, -mdy);
             Mouse.SetPosition(center.X, center.Y);
         }
         bool mouseFire = _mouseCaptured && !_swallowClick && mouse.LeftButton == ButtonState.Pressed;
@@ -231,8 +251,6 @@ internal sealed class TurokGame : Game
         float cx = gp.ThumbSticks.Right.X, cy = gp.ThumbSticks.Right.Y;
         if (kb.IsKeyDown(Keys.J)) cx = -1; if (kb.IsKeyDown(Keys.L)) cx = 1;
         if (kb.IsKeyDown(Keys.I)) cy = 1;  if (kb.IsKeyDown(Keys.K)) cy = -1;
-        if (Math.Abs(mdx) > Math.Abs(cx)) cx = Math.Clamp(mdx, -1f, 1f);
-        if (Math.Abs(mdy) > Math.Abs(cy)) cy = Math.Clamp(mdy, -1f, 1f);
         foreach (var (frame, button, hold) in _script)
             if (_framesReceived >= frame && _framesReceived < frame + hold) b |= button;
         foreach (var (frame, axis, hold) in _stickScript)
@@ -729,6 +747,8 @@ internal sealed class TurokGame : Game
                             $"stage1 map {m.Stage[1].X} uv0 ({v.T0.X:F2},{v.T0.Y:F2}) uv1 ({v.T1.X:F2},{v.T1.Y:F2}) c0 {v.Color0} c1 {v.Color1}");
             }
         }
+        if (_ramDumpFrames.Remove(_framesReceived)) DumpRam(_framesReceived);
+        foreach (var p in _pokes) if (p.frame == _framesReceived) PokeAdd(p.addr, p.add);
         bool scheduled = _screenshotFrames.Remove(_framesReceived);
         if (_screenshotPending || scheduled)
         {
@@ -738,5 +758,21 @@ internal sealed class TurokGame : Game
             if (scheduled && _screenshotFrames.Count == 0 && Environment.GetEnvironmentVariable("TUROK_EXIT_AFTER_SCREENSHOT") == "1")
                 Exit();
         }
+    }
+
+    private static unsafe void DumpRam(int frame)
+    {
+        byte* ram = Core.Ram(out uint size);
+        using var fs = File.Create(Path.Combine(AppContext.BaseDirectory, $"ram_{frame:D5}.bin"));
+        fs.Write(new ReadOnlySpan<byte>(ram, (int)size));
+    }
+
+    private static unsafe void PokeAdd(uint addr, float add)
+    {
+        byte* p = Core.Ram(out _) + (addr & 0x01FFFFFF);
+        uint w = (uint)(p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]);
+        float v = BitConverter.UInt32BitsToSingle(w) + add;
+        w = BitConverter.SingleToUInt32Bits(v);
+        p[0] = (byte)(w >> 24); p[1] = (byte)(w >> 16); p[2] = (byte)(w >> 8); p[3] = (byte)w;
     }
 }

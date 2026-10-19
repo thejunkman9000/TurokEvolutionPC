@@ -38,6 +38,9 @@ Level select: `--level data/levels/<pod>/<name>/<name>.atr` makes **New Game** s
 first jungle level, e.g. `--level data/levels/pod-07-dark-jungle/darkjungle_1/darkjungle_1.atr`.
 `analysis/level_paths.txt` lists the level paths found in the game's archive.
 
+Mouse look: click in the window to capture the mouse (Esc releases it). The mouse turns the view directly, like a PC
+shooter, instead of emulating the C-stick. `--mouse-sens 1.5` makes it faster.
+
 | Action | Keyboard / mouse | Xbox controller |
 |---|---|---|
 | Move | W A S D | left stick |

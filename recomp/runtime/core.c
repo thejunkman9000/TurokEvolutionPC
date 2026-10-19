@@ -144,6 +144,11 @@ CORE_API int core_start(const char *iso_path, const char *log_path) {
     return 1;
 }
 
+CORE_API const uint8_t *core_ram(uint32_t *size) {
+    if (size) *size = RAM_SIZE;
+    return g_ram;
+}
+
 CORE_API int core_state(char *msg, int msg_len) {
     if (msg && msg_len > 0) snprintf(msg, msg_len, "%s", s_fatal_msg);
     return s_state;

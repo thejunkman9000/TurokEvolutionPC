@@ -146,7 +146,28 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - Used by about 25 draws per frame in level 1 (the river by the bridge). Not visually verified yet. `TUROK_DEBUG_VIEW=5` shows indirect draws in magenta.
 - **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--widescreen] [--no-vsync] [--level <atr path>]`. F11 or Alt+Enter toggles borderless fullscreen.
 - **Widescreen:** the EFB is 854 wide. Perspective draws whose viewport spans the full 640 width are stretched across it, with the projection's X row scaled by 640/854. Every other draw, and any EFB copy narrower than full width (such as the shadow map), stays 4:3 and is shifted to the center.
-- **Mouse look:** click inside the window to capture the mouse, Esc to release. Motion maps to C-stick deflection, and left/right buttons map to R/L.
+- **Mouse look:** click inside the window to capture the mouse, Esc to release. Motion turns the view directly through `core_mouse_look`, not through the C-stick. Left/right buttons map to R/L. `--mouse-sens X` scales it (0.0022 rad/pixel at 1).
+  - The game's own stick turning is unusable for a mouse. Measured by overriding the value GetAxisX returns:
+    - Yaw: dead zone up to 0.3 normalized. 0.5 → 0.0075, 0.75 → 0.020, 1.0 → 0.052 rad/frame (≈180°/s max). 2 frames of latency, then a ~5-frame ramp.
+    - Pitch (raw C-stick Y): dead zone up to raw 35. Raw 36-61 → 0.0012-0.0084 rad/frame, then a jump to a fast speed of 0.028-0.034 rad/frame from raw 64. 3 frames of latency, then a ramp.
+  - **Yaw is written directly.** `*(0x803113AC)` (.sbss) is the player's view actor, and +0xF0 is its yaw in radians, [0, 2π).
+    - The rendered camera yaw is actor yaw − π. The game derives +0xC4 and the camera from it.
+    - Found by snapshotting RAM during a steady scripted turn, keeping floats whose deltas match the rendered yaw deltas, then poking each candidate. Only actor+0xF0 moved the camera.
+    - Several other actors keep copies at +0xC4/+0xF0. Actor +0xEC is body pitch (writing it tilts the player model), not look pitch.
+  - **Pitch has no scalar state.** It ends up as a bone rotation in the player's skeleton (0x8068xxxx animation data); group pokes there move it, single fields don't.
+    - The camera basis in the player object (`*(0x80310E28)`: +0x2188 forward, +0x2194 up) is recomputed every frame.
+    - So pitch is a closed loop through the game's own C-stick Y: the mouse moves a target pitch, and each frame `hle_look.c` picks the raw stick value from the measured curve. It predicts the 3 frames in flight, with gain 0.6, and dithers between the slow and fast speeds.
+    - Self-test (`TUROK_MOUSETEST=<frames>`): a +0.3 rad step settles to 0.299 in ~20 frames, and a 0.01 rad/frame drag trails by ~5 frames.
+    - The loop hands control back (no override) when settled or when the controller's C-stick Y is in use.
+  - The rendered camera's forward vector is cached at 0x802E22F8 (x, y, z; y up): yaw = atan2(x, z), pitch = atan2(y, |xz|). Writes happen only while actor yaw − π matches it, so cutscenes and other cameras are untouched.
+  - Input plumbing found on the way:
+    - PADStatus array at 0x802CC718.
+    - Per-port controller struct (184 bytes) at 0x802CC748. Normalized axes: main +0x3C/+0x40, C-stick +0x44/+0x48.
+    - Input events 406 (main stick) and 407 (C-stick) via fn_80007D40.
+    - Axis getters GetAxisX/Y = fn_80007734/fn_800079E0 (r3 = port, r4 = id), called once per frame from fn_80052D3C through a descriptor table at 0x8025DBDC.
+    - Per-player input state, 84 bytes each, at 0x803106EC (+0x10/+0x14 C-stick, Y negated).
+    - Actor scripts query inputs through fn_800C4240, which applies the 0.3 dead zone.
+  - Debug helpers added for this: `TUROK_RAMDUMP=f1,..` (host writes `ram_<frame>.bin`), `TUROK_POKE=frame:addr:delta` (host), `TUROK_MOUSETEST` (core).
   - Capture needs a fresh click while the window already has focus, so the click that activates the window doesn't grab the mouse. The capturing click doesn't fire, and losing focus releases the mouse.
 - **Level select:** every level, front-end screens included, is loaded by .atr path through `fn_80019700` (r4 = path, e.g. `data\levels\u_jcowlishaw\screens\mainmenu\mainmenu.atr`).
   - `runtime/hle_level.c` wraps it and logs `[level] load ...`.

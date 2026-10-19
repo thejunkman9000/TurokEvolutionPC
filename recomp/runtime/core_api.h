@@ -112,6 +112,9 @@ CORE_API void core_release_frame(void);
 // Debug: log every draw of the next frame the core completes to the log file.
 CORE_API void core_request_gx_dump(void);
 
+// Debug: guest main RAM (big-endian, 24 MB at physical 0); size in *size.
+CORE_API const uint8_t *core_ram(uint32_t *size);
+
 // ---- audio ------------------------------------------------------------------------
 // PCM the game plays through the AI DMA. core_read_audio copies up to max_frames
 // interleaved stereo frames (L, R, signed 16-bit host endian) and returns the count.
@@ -122,3 +125,8 @@ CORE_API int core_read_audio(int16_t *dst, int max_frames);
 // GameCube pad state for port 0..3. buttons uses the PAD_BUTTON_* bit layout.
 CORE_API void core_set_pad(int port, uint16_t buttons, int8_t stick_x, int8_t stick_y,
                            int8_t cstick_x, int8_t cstick_y, uint8_t trigger_l, uint8_t trigger_r);
+
+// Mouse look: rotate the player's first-person view directly (radians; positive
+// yaw turns left, positive pitch looks up). Accumulated and applied once per game
+// frame; ignored when the player's view isn't the active camera.
+CORE_API void core_mouse_look(float dyaw, float dpitch);

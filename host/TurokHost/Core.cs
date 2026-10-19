@@ -120,6 +120,13 @@ internal static unsafe partial class Core
     [LibraryImport(Dll, EntryPoint = "core_request_gx_dump")]
     public static partial void RequestGxDump();
 
+    // Turn the first-person view directly: radians; +yaw = left, +pitch = up.
+    [LibraryImport(Dll, EntryPoint = "core_mouse_look")]
+    public static partial void MouseLook(float dyaw, float dpitch);
+
+    [LibraryImport(Dll, EntryPoint = "core_ram")]
+    public static partial byte* Ram(out uint size);
+
     [LibraryImport(Dll, EntryPoint = "core_set_pad")]
     public static partial void SetPad(int port, ushort buttons, sbyte stickX, sbyte stickY,
                                       sbyte cstickX, sbyte cstickY, byte triggerL, byte triggerR);
