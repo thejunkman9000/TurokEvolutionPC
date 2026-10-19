@@ -31,6 +31,8 @@ internal sealed class TurokGame : Game
     private Texture2D? _white;
     // EFB-to-texture copies, by copy id (persist across frames like the game's textures)
     private readonly Dictionary<uint, RenderTarget2D> _efbCopies = new();
+    // Guest (EFB texel) size of each copy: the render targets are upscaled and, in widescreen, widened.
+    private readonly Dictionary<uint, Vector2> _efbCopyGuestSize = new();
     private readonly Vector4[] _texSize = new Vector4[8];
 
     // Last frame copied out of the core (redrawn until a newer one arrives).
@@ -75,6 +77,7 @@ internal sealed class TurokGame : Game
         public readonly uint[] TextureIds = new uint[8];
         public uint Kind, CopyId, CopyMode, ClearColor;
         public Rectangle CopySrc;
+        public Vector2 CopyGuestSize;
         public float ClearDepth;
         public readonly uint[] CopyRefs = new uint[8];  // EFB copy ids referenced per tex map (0 = none)
     }
@@ -368,6 +371,9 @@ internal sealed class TurokGame : Game
                 bool wideCopy = _centerOff != 0 && cb->CopySrc[0] <= 0 && cb->CopySrc[2] >= 600;
                 b.CopySrc = new Rectangle(MapX(cb->CopySrc[0], wideCopy), cb->CopySrc[1], MapW(cb->CopySrc[2], wideCopy), cb->CopySrc[3]);
                 b.ClearColor = cb->ClearColor; b.ClearDepth = cb->ClearDepth;
+                b.CopyGuestSize = (cb->CopyMode & 0x100) != 0
+                    ? new Vector2(Math.Max(1, (int)cb->CopySrc[2] / 2), Math.Max(1, (int)cb->CopySrc[3] / 2))
+                    : new Vector2(cb->CopySrc[2], cb->CopySrc[3]);
                 for (int t = 0; t < 8; t++)
                 {
                     b.CopyRefs[t] = cb->Textures[t] >= 0 && f->Textures[cb->Textures[t]].Rgba == null ? f->Textures[cb->Textures[t]].Id : 0;
@@ -607,6 +613,7 @@ internal sealed class TurokGame : Game
             rt = new RenderTarget2D(gd, w, h, false, SurfaceFormat.Color, DepthFormat.None);
             _efbCopies[b.CopyId] = rt;
         }
+        _efbCopyGuestSize[b.CopyId] = b.CopyGuestSize;
 
         gd.SetRenderTarget(rt);
         _copyFx!.Parameters["Mode"].SetValue((float)(b.CopyMode & 0xFF));
@@ -687,7 +694,8 @@ internal sealed class TurokGame : Game
             gd.RasterizerState = CullStates[m.Cull];
             gd.Viewport = new Viewport(b.Viewport.X, b.Viewport.Y, b.Viewport.Width, b.Viewport.Height, 0f, 1f);
             gd.ScissorRectangle = Rectangle.Intersect(b.Scissor, _target!.Bounds);
-            gd.DepthStencilState = m.Depth;
+            // debug view 6: indirect draws ignore depth, so occluded ones (water) can be inspected
+            gd.DepthStencilState = _debugView == 6 && m.IndMisc.Y != 0 ? DepthStencilState.None : m.Depth;
             gd.BlendState = m.Blend;
 
             P["Proj"].SetValue(b.Projection);
@@ -710,7 +718,10 @@ internal sealed class TurokGame : Game
                 if (b.CopyRefs[t] != 0) tex = _efbCopies.TryGetValue(b.CopyRefs[t], out var rt) ? rt : null;
                 var bound = tex ?? _white;
                 P["Tex" + t].SetValue(bound);
-                _texSize[t] = new Vector4(bound.Width, bound.Height, 0, 0);
+                // Guest texel size (indirect stages address in texels), not the upscaled copy target's size.
+                var size = new Vector2(bound.Width, bound.Height);
+                if (b.CopyRefs[t] != 0 && tex != null && _efbCopyGuestSize.TryGetValue(b.CopyRefs[t], out var g)) size = g;
+                _texSize[t] = new Vector4(size.X, size.Y, 0, 0);
             }
             P["TexSize"].SetValue(_texSize);
 
@@ -744,7 +755,9 @@ internal sealed class TurokGame : Game
                 var m = _materials[b.Material];
                 var v = _vertices[b.First];
                 bw.WriteLine($"verts {b.Count} stages {m.Misc.Y} maps [{string.Join(",", b.TextureIds)}] stage0 map {m.Stage[0].X} coord {m.MapCoord[0]} " +
-                            $"stage1 map {m.Stage[1].X} uv0 ({v.T0.X:F2},{v.T0.Y:F2}) uv1 ({v.T1.X:F2},{v.T1.Y:F2}) c0 {v.Color0} c1 {v.Color1}");
+                            $"stage1 map {m.Stage[1].X} uv0 ({v.T0.X:F2},{v.T0.Y:F2}) uv1 ({v.T1.X:F2},{v.T1.Y:F2}) c0 {v.Color0} c1 {v.Color1}" +
+                            (m.IndMisc.Y != 0 ? $" | ind n {m.IndMisc.X} stage0 {m.IndStage[0]} cmd0 {m.IndCmd0[0]}/{m.IndCmd1[0]} cmd1 {m.IndCmd0[1]}/{m.IndCmd1[1]} " +
+                             $"mtx {m.IndMtx[0]} {m.IndMtx[1]} size {m.CoordSize[0]} copies [{string.Join(",", b.CopyRefs)}] vp {b.Viewport}" : ""));
             }
         }
         if (_ramDumpFrames.Remove(_framesReceived)) DumpRam(_framesReceived);

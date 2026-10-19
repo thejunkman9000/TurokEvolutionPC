@@ -82,63 +82,62 @@ float4 SampleMapGrad(int map, float2 uv, float2 dx, float2 dy)
     return tex2Dgrad(Samp7, uv, dx, dy);
 }
 
-float4 Swizzle(float4 v, float4 t)
+// ---- TEV combiner, integer like the hardware (Dolphin's semantics) ----
+// Colours are 8-bit (0..255) inputs; registers hold 11-bit signed values (-1024..1023).
+int4 Q8(float4 v) { return int4(round(saturate(v) * 255.0)); }
+int4 ISwizzle(int4 v, float4 t) { return int4(v[(int)t.x], v[(int)t.y], v[(int)t.z], v[(int)t.w]); }
+
+// Linear interpolate, bias, add/subtract, scale (op = bias (3 = compare), scale, subtract, clamp).
+// C is widened to 0..256, and the shift is folded into the lerp with the hardware's rounding.
+int3 TevLerp(int3 A, int3 B, int3 C, int3 D, int bias, bool sub, bool alpha, int shift)
 {
-    return float4(v[(int)t.x], v[(int)t.y], v[(int)t.z], v[(int)t.w]);
+    C += C >> 7;
+    if (bias == 1) D += 128; else if (bias == 2) D -= 128;
+    int3 l = (A << 8) + (B - A) * C;
+    if (shift != 3) { l = l << shift; D = D << shift; }
+    if ((shift == 3) == alpha) l += sub ? 127 : 128;
+    int3 r = l >> 8;
+    r = sub ? D - r : D + r;
+    if (shift == 3) r = r >> 1;
+    return r;
 }
 
-float Bias(float b) { return b == 1.0 ? 0.5 : (b == 2.0 ? -0.5 : 0.0); }
-float Scale(float s) { return s == 1.0 ? 2.0 : (s == 2.0 ? 4.0 : (s == 3.0 ? 0.5 : 1.0)); }
-
-float3 TevColor(float3 a, float3 b, float3 c, float3 d, float4 op)
+int3 TevColor(int3 a, int3 b, int3 c, int3 d, float4 op)
 {
-    float3 r;
+    int3 r;
     if (op.x == 3.0)
     {
-        // compare mode: d + (a CMP b ? c : 0)
+        // compare mode: d + (a CMP b ? c : 0); R8, GR16, BGR24 compare packed values, RGB8 per channel
         int cmp = (int)op.y * 2 + (int)op.z;
-        float3 qa = round(a * 255.0), qb = round(b * 255.0);
-        float va, vb;
-        if (cmp < 2)      { va = qa.r; vb = qb.r; }
-        else if (cmp < 4) { va = qa.g * 256.0 + qa.r; vb = qb.g * 256.0 + qb.r; }
-        else              { va = qa.b * 65536.0 + qa.g * 256.0 + qa.r; vb = qb.b * 65536.0 + qb.g * 256.0 + qb.r; }
-        if (cmp == 6)      r = float3(qa.r > qb.r ? c.r : 0, qa.g > qb.g ? c.g : 0, qa.b > qb.b ? c.b : 0);
-        else if (cmp == 7) r = float3(qa.r == qb.r ? c.r : 0, qa.g == qb.g ? c.g : 0, qa.b == qb.b ? c.b : 0);
-        else if (cmp & 1)  r = (va == vb) ? c : float3(0, 0, 0);
-        else               r = (va > vb) ? c : float3(0, 0, 0);
+        int va, vb;
+        if (cmp < 2)      { va = a.r; vb = b.r; }
+        else if (cmp < 4) { va = (a.g << 8) | a.r; vb = (b.g << 8) | b.r; }
+        else              { va = (a.b << 16) | (a.g << 8) | a.r; vb = (b.b << 16) | (b.g << 8) | b.r; }
+        if (cmp == 6)      r = int3(a.r > b.r ? c.r : 0, a.g > b.g ? c.g : 0, a.b > b.b ? c.b : 0);
+        else if (cmp == 7) r = int3(a.r == b.r ? c.r : 0, a.g == b.g ? c.g : 0, a.b == b.b ? c.b : 0);
+        else if (cmp & 1)  r = (va == vb) ? c : int3(0, 0, 0);
+        else               r = (va > vb) ? c : int3(0, 0, 0);
         r = d + r;
     }
-    else
-    {
-        float3 l = lerp(a, b, c);
-        r = (op.z > 0.5 ? d - l : d + l) + Bias(op.x);
-        r *= Scale(op.y);
-    }
-    return op.w > 0.5 ? saturate(r) : clamp(r, -4.0, 4.0);
+    else r = TevLerp(a, b, c, d, (int)op.x, op.z > 0.5, false, (int)op.y);
+    return op.w > 0.5 ? clamp(r, 0, 255) : clamp(r, -1024, 1023);
 }
 
-float TevAlpha(float a, float b, float c, float d, float4 op)
+int TevAlpha(int a, int b, int c, int d, float4 op)
 {
-    float r;
+    int r;
     if (op.x == 3.0)
     {
         int cmp = (int)op.y * 2 + (int)op.z;
-        float qa = round(a * 255.0), qb = round(b * 255.0);
-        bool hit = (cmp & 1) ? (qa == qb) : (qa > qb);
-        r = d + (hit ? c : 0.0);
+        bool hit = (cmp & 1) ? (a == b) : (a > b);
+        r = d + (hit ? c : 0);
     }
-    else
-    {
-        float l = lerp(a, b, c);
-        r = (op.z > 0.5 ? d - l : d + l) + Bias(op.x);
-        r *= Scale(op.y);
-    }
-    return op.w > 0.5 ? saturate(r) : clamp(r, -4.0, 4.0);
+    else r = TevLerp(int3(a, a, a), int3(b, b, b), int3(c, c, c), int3(d, d, d), (int)op.x, op.z > 0.5, true, (int)op.y).x;
+    return op.w > 0.5 ? clamp(r, 0, 255) : clamp(r, -1024, 1023);
 }
 
-bool AlphaCompare(float a, float ref, float func)
+bool AlphaCompare(int a, int ref, float func)
 {
-    a = round(a * 255.0); ref = round(ref * 255.0);
     if (func == 0.0) return false;
     if (func == 1.0) return a < ref;
     if (func == 2.0) return a == ref;
@@ -194,8 +193,9 @@ float4 MainPS(VSOut i) : COLOR0
     int2 tevcoord = int2(0, 0);
     int alphabump = 0;
 
-    float4 reg[4] = { Regs[0], Regs[1], Regs[2], Regs[3] };
-    float4 result = reg[0];
+    int4 reg[4] = { int4(round(Regs[0] * 255.0)), int4(round(Regs[1] * 255.0)),
+                    int4(round(Regs[2] * 255.0)), int4(round(Regs[3] * 255.0)) };
+    int4 result = reg[0];
     int n = (int)Misc.y;
 
     [loop]
@@ -244,35 +244,37 @@ float4 MainPS(VSOut i) : COLOR0
                 tex = SampleMapGrad(map, float2(tevcoord) / (128.0 * TexSize[map].xy), duvdx[coord], duvdy[coord]);
             }
         }
-        tex = Swizzle(tex, SwapTable[(int)sw.y]);
-        float ab = alphabump / 255.0, abn = (alphabump | (alphabump >> 5)) / 255.0;
-        float4 ras = st.y == 0.0 ? i.C0 : (st.y == 1.0 ? i.C1 : (st.y == 2.0 ? float4(ab, ab, ab, ab) :
-                     (st.y == 3.0 ? float4(abn, abn, abn, abn) : float4(0, 0, 0, 0))));
-        ras = Swizzle(ras, SwapTable[(int)sw.x]);
-        float4 k = Konst[s];
+        int4 itex = ISwizzle(Q8(tex), SwapTable[(int)sw.y]);
+        int abn = alphabump | (alphabump >> 5);
+        int4 ras = st.y == 0.0 ? Q8(i.C0) : (st.y == 1.0 ? Q8(i.C1) : (st.y == 2.0 ? int4(alphabump, alphabump, alphabump, alphabump) :
+                   (st.y == 3.0 ? int4(abn, abn, abn, abn) : int4(0, 0, 0, 0))));
+        ras = ISwizzle(ras, SwapTable[(int)sw.x]);
+        int4 k = Q8(Konst[s]);
 
-        float3 cin[16];
+        int3 cin[16];
         cin[0] = reg[0].rgb; cin[1] = reg[0].aaa; cin[2] = reg[1].rgb; cin[3] = reg[1].aaa;
         cin[4] = reg[2].rgb; cin[5] = reg[2].aaa; cin[6] = reg[3].rgb; cin[7] = reg[3].aaa;
-        cin[8] = tex.rgb; cin[9] = tex.aaa; cin[10] = ras.rgb; cin[11] = ras.aaa;
-        cin[12] = float3(1, 1, 1); cin[13] = float3(0.5, 0.5, 0.5); cin[14] = k.rgb; cin[15] = float3(0, 0, 0);
-        float ain[8];
+        cin[8] = itex.rgb; cin[9] = itex.aaa; cin[10] = ras.rgb; cin[11] = ras.aaa;
+        cin[12] = int3(255, 255, 255); cin[13] = int3(128, 128, 128); cin[14] = k.rgb; cin[15] = int3(0, 0, 0);
+        int ain[8];
         ain[0] = reg[0].a; ain[1] = reg[1].a; ain[2] = reg[2].a; ain[3] = reg[3].a;
-        ain[4] = tex.a; ain[5] = ras.a; ain[6] = k.a; ain[7] = 0.0;
+        ain[4] = itex.a; ain[5] = ras.a; ain[6] = k.a; ain[7] = 0;
 
         float4 ci = ColorIn[s], ai = AlphaIn[s];
-        // a, b, c are 8-bit unsigned inputs; d keeps the full signed range
-        float3 col = TevColor(saturate(cin[(int)ci.x]), saturate(cin[(int)ci.y]), saturate(cin[(int)ci.z]),
-                              cin[(int)ci.w], ColorOp[s]);
-        float alp = TevAlpha(saturate(ain[(int)ai.x]), saturate(ain[(int)ai.y]), saturate(ain[(int)ai.z]),
-                             ain[(int)ai.w], AlphaOp[s]);
+        // a, b, c use the low 8 bits of their input; d keeps the full signed 11-bit range
+        int3 col = TevColor(cin[(int)ci.x] & 255, cin[(int)ci.y] & 255, cin[(int)ci.z] & 255,
+                            cin[(int)ci.w], ColorOp[s]);
+        int alp = TevAlpha(ain[(int)ai.x] & 255, ain[(int)ai.y] & 255, ain[(int)ai.z] & 255,
+                           ain[(int)ai.w], AlphaOp[s]);
         reg[(int)st.z].rgb = col;
         reg[(int)st.w].a = alp;
-        result = float4(col, alp);
+        result = int4(col, alp);
     }
+    // the last stage's output is what leaves the TEV, wrapped to 8 bits
+    result &= 255;
 
-    bool p0 = AlphaCompare(result.a, AlphaTest.x, AlphaTest.z);
-    bool p1 = AlphaCompare(result.a, AlphaTest.y, AlphaTest.w);
+    bool p0 = AlphaCompare(result.a, (int)round(AlphaTest.x * 255.0), AlphaTest.z);
+    bool p1 = AlphaCompare(result.a, (int)round(AlphaTest.y * 255.0), AlphaTest.w);
     bool ok;
     if (Misc.x == 0.0) ok = p0 && p1;
     else if (Misc.x == 1.0) ok = p0 || p1;
@@ -296,11 +298,12 @@ float4 MainPS(VSOut i) : COLOR0
         else if (fsel == 6.0) f = exp2(-8.0 * (1.0 - f));
         else if (fsel == 7.0) { f = 1.0 - f; f = exp2(-8.0 * f * f); }
         if (Misc.z == 4.0) return float4(f, f, f, 1);  // debug view 4: fog amount
-        result.rgb = lerp(saturate(result.rgb), FogColor.rgb, f);
+        int ifog = (int)round(f * 256.0);
+        result.rgb = (result.rgb * (256 - ifog) + Q8(FogColor).rgb * ifog) >> 8;
     }
     else if (Misc.z == 4.0) return float4(0, 0, 0.25, 1);  // no fog on this draw
 
-    return saturate(result);
+    return float4(result) / 255.0;
 }
 
 technique Tev

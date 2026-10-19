@@ -142,6 +142,16 @@ uint32_t gx_material_build(CoreMaterial *m) {
             if (budget-- > 0) logf_("[fog] fsel %u ortho %u a %g c %g b %u>>%u color %06X", (f3 >> 21) & 7, (f3 >> 20) & 1,
                                     a, c, gx_bp(0xEF) & 0xFFFFFF, gx_bp(0xF0) & 0x1F, col & 0xFFFFFF);
         }
+        // Range-adjusted fog (BP 0xE8 bit 10) is not implemented; log if a level turns it on.
+        uint32_t range = gx_bp(0xE8);
+        static uint32_t s_last_range;
+        if (((f3 >> 21) & 7) && (range & 0x400) && range != s_last_range) {
+            static int rbudget = 5;
+            s_last_range = range;
+            if (rbudget-- > 0) logf_("[fog] range adjust on: center %u k %06X %06X %06X %06X %06X", range & 0x3FF,
+                                     gx_bp(0xE9) & 0xFFFFFF, gx_bp(0xEA) & 0xFFFFFF, gx_bp(0xEB) & 0xFFFFFF,
+                                     gx_bp(0xEC) & 0xFFFFFF, gx_bp(0xED) & 0xFFFFFF);
+        }
         m->fog_mode[1] = (float)((f3 >> 20) & 1);
         gx_viewport_z(&m->fog_mode[2], &m->fog_mode[3]);
         m->fog_color[0] = ((col >> 16) & 0xFF) / 255.0f;
@@ -194,6 +204,15 @@ uint32_t gx_material_build(CoreMaterial *m) {
             if (!(used_maps & (1u << map))) { used_maps |= 1u << map; map_coord[map] = (iref >> (6 * i + 3)) & 7; }
         }
         for (int i = 0; i < 8; i++) m->map_coord[i / 4][i % 4] = (float)map_coord[i];
+    }
+    {   // EFB pixel format (PE_CONTROL 0-2: RGB8, RGBA6, RGB565, Z24) and dither (BP 0x41 bit 2), logged on change
+        static uint32_t s_last_pe = 0xFFFFFFFFu;
+        uint32_t pe = (gx_bp(0x43) & 7) | (gx_bp(0x41) & 4) << 1;
+        if (pe != s_last_pe) {
+            static int pbudget = 10;
+            s_last_pe = pe;
+            if (pbudget-- > 0) logf_("[pe] efb format %u dither %u", pe & 7, pe >> 3);
+        }
     }
     m->blend = gx_bp(0x41);
     m->zmode = gx_bp(0x40);
