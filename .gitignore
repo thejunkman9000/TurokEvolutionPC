@@ -35,3 +35,6 @@ __pycache__/
 # --- Third-party reference sources (re-fetch with curl, see analysis/NOTES.md) ---
 reference/dolphin/
 reference/dolsdk/
+
+# Level sweep captures and logs
+analysis/sweep/

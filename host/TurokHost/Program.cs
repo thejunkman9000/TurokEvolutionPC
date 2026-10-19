@@ -11,6 +11,7 @@ internal static class Program
     private static void Main(string[] args)
     {
         // TurokEvolution.exe [disc.iso] [--fullscreen] [--scale N] [--no-vsync] [--widescreen]
+        //                    [--level data/levels/<pod>/<name>/<name>.atr]  (New Game starts that level)
         string? iso = null;
         var opt = new TurokGame.Options();
         for (int i = 0; i < args.Length; i++)
@@ -20,6 +21,7 @@ internal static class Program
             case "--fullscreen": opt = opt with { Fullscreen = true }; break;
             case "--no-vsync": opt = opt with { VSync = false }; break;
             case "--widescreen": opt = opt with { Widescreen = true }; break;
+            case "--level" when i + 1 < args.Length: Environment.SetEnvironmentVariable("TUROK_LEVEL", args[++i]); break;
             case "--scale" when i + 1 < args.Length && int.TryParse(args[i + 1], out var sc): opt = opt with { Scale = sc }; i++; break;
             default: iso ??= args[i]; break;
             }

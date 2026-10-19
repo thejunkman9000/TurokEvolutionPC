@@ -53,6 +53,7 @@ internal sealed class TurokGame : Game
     private bool _fullscreenKeyHeld;
     // Mouse look: click in the window to capture the mouse, Esc to release.
     private bool _mouseCaptured;
+    private bool _wasActive, _prevLeftDown, _swallowClick;
     private const float MouseSensitivity = 0.06f;  // stick deflection per pixel per update
     private readonly float _debugView = float.TryParse(Environment.GetEnvironmentVariable("TUROK_DEBUG_VIEW"), out var dv) ? dv : 0;
     private readonly List<int> _screenshotFrames = new();
@@ -192,14 +193,23 @@ internal sealed class TurokGame : Game
         if (kb.IsKeyDown(Keys.W)) ly = 1;  if (kb.IsKeyDown(Keys.S)) ly = -1;
         var mouse = Mouse.GetState();
         var center = new Point(Window.ClientBounds.Width / 2, Window.ClientBounds.Height / 2);
-        if (!_mouseCaptured && IsActive && mouse.LeftButton == ButtonState.Pressed &&
-            Window.ClientBounds.Contains(Window.ClientBounds.X + mouse.X, Window.ClientBounds.Y + mouse.Y))
+        // Capture only on a fresh click inside the window while it already had focus, so the
+        // click that brings the window to the front (or lands on another window) is ignored.
+        bool leftDown = mouse.LeftButton == ButtonState.Pressed;
+        bool clicked = leftDown && !_prevLeftDown;
+        bool focusedBefore = _wasActive;
+        _prevLeftDown = leftDown;
+        _wasActive = IsActive;
+        if (!_mouseCaptured && IsActive && focusedBefore && clicked &&
+            new Rectangle(0, 0, Window.ClientBounds.Width, Window.ClientBounds.Height).Contains(mouse.X, mouse.Y))
         {
             _mouseCaptured = true;
+            _swallowClick = true;  // the capturing click doesn't also fire
             IsMouseVisible = false;
             Mouse.SetPosition(center.X, center.Y);
             mouse = Mouse.GetState();
         }
+        if (_swallowClick && !leftDown) _swallowClick = false;
         if (_mouseCaptured && (kb.IsKeyDown(Keys.Escape) || !IsActive))
         {
             _mouseCaptured = false;
@@ -212,7 +222,7 @@ internal sealed class TurokGame : Game
             mdy = -(mouse.Y - center.Y) * MouseSensitivity;
             Mouse.SetPosition(center.X, center.Y);
         }
-        bool mouseFire = _mouseCaptured && mouse.LeftButton == ButtonState.Pressed;
+        bool mouseFire = _mouseCaptured && !_swallowClick && mouse.LeftButton == ButtonState.Pressed;
         bool mouseAlt = _mouseCaptured && mouse.RightButton == ButtonState.Pressed;
         float lt = Math.Max(gp.Triggers.Left, kb.IsKeyDown(Keys.Z) || mouseAlt ? 1f : 0f);
         float rt = Math.Max(gp.Triggers.Right, mouseFire ? 1f : 0f);

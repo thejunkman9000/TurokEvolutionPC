@@ -29,3 +29,6 @@ CARDSetStatus
 80124708  # CARDCheckAsync
 80125914  # CARDFormat
 80126950  # CARDDeleteAsync
+
+# Level loading (logged; TUROK_LEVEL redirects the first level): runtime/hle_level.c.
+80019700  # level load by .atr path

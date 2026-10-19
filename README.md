@@ -34,6 +34,10 @@ host\TurokHost\bin\Release\net9.0-windows\TurokEvolution.exe "D:\Games\Turok - E
 Options: `--fullscreen`, `--scale 1..4` (internal resolution, multiples of 640x480; default 2),
 `--widescreen` (16:9: the 3D view gets wider, HUD and menus stay 4:3), `--no-vsync`. If the `.iso` sits next to the executable (or a few folders above it) the path can be omitted.
 
+Level select: `--level data/levels/<pod>/<name>/<name>.atr` makes **New Game** start that level instead of the
+first jungle level, e.g. `--level data/levels/pod-07-dark-jungle/darkjungle_1/darkjungle_1.atr`.
+`analysis/level_paths.txt` lists the level paths found in the game's archive.
+
 | Action | Keyboard / mouse | Xbox controller |
 |---|---|---|
 | Move | W A S D | left stick |

@@ -144,12 +144,21 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - Indirect stages are sampled at shifted coordinates, then each stage's format, bias and bump alpha are applied, followed by the static or S/T-dynamic matrices and the wrap/add-previous steps, with s24 wrap.
   - Stages sample with explicit gradients. Setup-unit texcoord sizes come from BP 0x30+.
   - Used by about 25 draws per frame in level 1 (the river by the bridge). Not visually verified yet. `TUROK_DEBUG_VIEW=5` shows indirect draws in magenta.
-- **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--widescreen] [--no-vsync]`. F11 or Alt+Enter toggles borderless fullscreen.
+- **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--widescreen] [--no-vsync] [--level <atr path>]`. F11 or Alt+Enter toggles borderless fullscreen.
 - **Widescreen:** the EFB is 854 wide. Perspective draws whose viewport spans the full 640 width are stretched across it, with the projection's X row scaled by 640/854. Every other draw, and any EFB copy narrower than full width (such as the shadow map), stays 4:3 and is shifted to the center.
-- **Mouse look:** click to capture the mouse, Esc to release. Motion maps to C-stick deflection, and left/right buttons map to R/L.
+- **Mouse look:** click inside the window to capture the mouse, Esc to release. Motion maps to C-stick deflection, and left/right buttons map to R/L.
+  - Capture needs a fresh click while the window already has focus, so the click that activates the window doesn't grab the mouse. The capturing click doesn't fire, and losing focus releases the mouse.
+- **Level select:** every level, front-end screens included, is loaded by .atr path through `fn_80019700` (r4 = path, e.g. `data\levels\u_jcowlishaw\screens\mainmenu\mainmenu.atr`).
+  - `runtime/hle_level.c` wraps it and logs `[level] load ...`.
+  - With `TUROK_LEVEL` (or the host's `--level`) set, the first non-front-end load (New Game's `pod01_01_ttjungle`) is redirected. The replacement string is written at 0x80001800, in the OS's free low memory.
+  - Dead ends: Game.txt only names the front-end `begin.atr`. The `Pod01_01_TTJungle` literal at 0x8026DF74 is only the default level stored in a new save (fn_80155578).
+  - The variable is read with `GetEnvironmentVariableA`, because the CRT's environment copy predates the host setting it.
+- **Level sweep** (one level per pod, entered via New Game; 12 levels from pod 2 flight training to the pod 18 T-rex area): all load and run without a fatal error at 49-60 fps, up to about 8000 draws and 61k verts per frame.
+  - No level uses lines, points or Z copies.
+  - Indirect texturing appears in Dark Jungle and the escape flight.
 - **Build:** `build.ps1 -Iso <path>` builds a clean clone end to end (verified): extract the DOL, generate C, MSVC via vswhere + CMake/Ninja (run through a temporary .cmd), install mgfxc locally, build the host.
 - Known gaps:
-  - Lines and points (not used in level 1).
+  - Lines and points (not used by any of the 12 sampled levels).
   - Z-buffer EFB copies.
   - Range-adjusted fog.
   - Audio: no polyphase resampling (it needs the DSP ROM coefficients; linear is used instead), no initial time delay (ITD), and no DVD streaming audio (AI streaming is untested).
