@@ -20,7 +20,11 @@ internal sealed class TurokGame : Game
     private RenderTarget2D? _target;
     private SpriteBatch? _sprites;
     private Effect? _tev;
+    private Effect? _copyFx;
+    private BasicEffect? _clearFx;
     private Texture2D? _white;
+    // EFB-to-texture copies, by copy id (persist across frames like the game's textures)
+    private readonly Dictionary<uint, RenderTarget2D> _efbCopies = new();
 
     // Last frame copied out of the core (redrawn until a newer one arrives).
     private TevVertex[] _vertices = Array.Empty<TevVertex>();
@@ -43,6 +47,7 @@ internal sealed class TurokGame : Game
     private readonly List<int> _screenshotFrames = new();
     private bool _screenshotPending;
     private readonly List<(int Frame, PadButtons Button, int Hold)> _script = new();
+    private readonly List<(int Frame, string Axis, int Hold)> _stickScript = new();
 
     private sealed class Batch
     {
@@ -53,6 +58,10 @@ internal sealed class TurokGame : Game
         public readonly SamplerState[] Samplers = new SamplerState[8];
         public Rectangle Viewport, Scissor;
         public readonly uint[] TextureIds = new uint[8];
+        public uint Kind, CopyId, CopyMode, ClearColor;
+        public Rectangle CopySrc;
+        public float ClearDepth;
+        public readonly uint[] CopyRefs = new uint[8];  // EFB copy ids referenced per tex map (0 = none)
     }
 
     // A CoreMaterial converted to effect parameter arrays and state objects.
@@ -62,9 +71,10 @@ internal sealed class TurokGame : Game
         public readonly Vector4[] ColorOp = new Vector4[16], AlphaOp = new Vector4[16];
         public readonly Vector4[] Stage = new Vector4[16], Swap = new Vector4[16], Konst = new Vector4[16];
         public readonly Vector4[] SwapTable = new Vector4[4], Regs = new Vector4[4], MapCoord = new Vector4[2];
-        public Vector4 AlphaTest, Misc;
+        public Vector4 AlphaTest, Misc, Fog, FogMode, FogColor;
         public BlendState Blend = BlendState.Opaque;
         public DepthStencilState Depth = DepthStencilState.None;
+        public uint Cull;
     }
 
     public TurokGame(string isoPath)
@@ -84,12 +94,15 @@ internal sealed class TurokGame : Game
         // one if TUROK_EXIT_AFTER_SCREENSHOT=1).
         foreach (var part in (Environment.GetEnvironmentVariable("TUROK_SCREENSHOT") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
             if (int.TryParse(part, out var n)) _screenshotFrames.Add(n);
-        // TUROK_INPUT=frame:Button[:holdFrames],...  e.g. "150:Down:4,200:A:6"
+        // TUROK_INPUT=frame:Button[:holdFrames],...  e.g. "150:Down:4,200:A:6".
+        // Sticks: LX+ LX- LY+ LY- (main) and CX+ CX- CY+ CY- (C-stick) at full deflection.
         foreach (var part in (Environment.GetEnvironmentVariable("TUROK_INPUT") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
         {
             var f = part.Split(':');
-            if (f.Length >= 2 && int.TryParse(f[0], out var at) && Enum.TryParse<PadButtons>(f[1], true, out var btn))
-                _script.Add((at, btn, f.Length > 2 && int.TryParse(f[2], out var h) ? h : 6));
+            if (f.Length < 2 || !int.TryParse(f[0], out var at)) continue;
+            int hold = f.Length > 2 && int.TryParse(f[2], out var h) ? h : 6;
+            if (Enum.TryParse<PadButtons>(f[1], true, out var btn)) _script.Add((at, btn, hold));
+            else if (f[1].Length == 3 && "LXLYCXCY".Contains(f[1][..2].ToUpperInvariant())) _stickScript.Add((at, f[1].ToUpperInvariant(), hold));
         }
     }
 
@@ -105,8 +118,9 @@ internal sealed class TurokGame : Game
 
     protected override void LoadContent()
     {
+        // PreserveContents: the EFB is unbound mid-frame for EFB-to-texture copies.
         _target = new RenderTarget2D(GraphicsDevice, EfbWidth * RenderScale, EfbHeight * RenderScale, false,
-                                     SurfaceFormat.Color, DepthFormat.Depth24Stencil8);
+                                     SurfaceFormat.Color, DepthFormat.Depth24Stencil8, 0, RenderTargetUsage.PreserveContents);
         _sprites = new SpriteBatch(GraphicsDevice);
         using (var s = typeof(TurokGame).Assembly.GetManifestResourceStream("Tev.mgfxo")!)
         using (var ms = new MemoryStream())
@@ -114,6 +128,14 @@ internal sealed class TurokGame : Game
             s.CopyTo(ms);
             _tev = new Effect(GraphicsDevice, ms.ToArray());
         }
+        using (var s = typeof(TurokGame).Assembly.GetManifestResourceStream("Copy.mgfxo")!)
+        using (var ms = new MemoryStream())
+        {
+            s.CopyTo(ms);
+            _copyFx = new Effect(GraphicsDevice, ms.ToArray());
+        }
+        _clearFx = new BasicEffect(GraphicsDevice) { VertexColorEnabled = true, World = Matrix.Identity,
+                                                     View = Matrix.Identity, Projection = Matrix.Identity };
         _white = new Texture2D(GraphicsDevice, 1, 1);
         _white.SetData(new[] { Color.White });
     }
@@ -145,10 +167,19 @@ internal sealed class TurokGame : Game
         float rt = Math.Max(gp.Triggers.Right, Mouse.GetState().LeftButton == ButtonState.Pressed ? 1f : 0f);
         if (lt > 0.9f) b |= PadButtons.L;
         if (rt > 0.9f) b |= PadButtons.R;
+        float cx = gp.ThumbSticks.Right.X, cy = gp.ThumbSticks.Right.Y;
+        if (kb.IsKeyDown(Keys.J)) cx = -1; if (kb.IsKeyDown(Keys.L)) cx = 1;
+        if (kb.IsKeyDown(Keys.I)) cy = 1;  if (kb.IsKeyDown(Keys.K)) cy = -1;
         foreach (var (frame, button, hold) in _script)
             if (_framesReceived >= frame && _framesReceived < frame + hold) b |= button;
+        foreach (var (frame, axis, hold) in _stickScript)
+        {
+            if (_framesReceived < frame || _framesReceived >= frame + hold) continue;
+            float v = axis[2] == '+' ? 1 : -1;
+            switch (axis[..2]) { case "LX": lx = v; break; case "LY": ly = v; break; case "CX": cx = v; break; case "CY": cy = v; break; }
+        }
         static sbyte Axis(float v) => (sbyte)Math.Clamp((int)(v * 100), -100, 100);
-        Core.SetPad(0, (ushort)b, Axis(lx), Axis(ly), Axis(gp.ThumbSticks.Right.X), Axis(gp.ThumbSticks.Right.Y),
+        Core.SetPad(0, (ushort)b, Axis(lx), Axis(ly), Axis(cx), Axis(cy),
                     (byte)(lt * 255), (byte)(rt * 255));
 
         PumpAudio();
@@ -247,8 +278,12 @@ internal sealed class TurokGame : Game
                                           m[3], m[7], m[11], m[15]);
                 b.First = (int)cb->FirstVertex; b.Count = (int)cb->VertexCount;
                 b.Material = (int)cb->Material;
+                b.Kind = cb->Kind; b.CopyId = cb->CopyId; b.CopyMode = cb->CopyMode;
+                b.CopySrc = new Rectangle(cb->CopySrc[0], cb->CopySrc[1], cb->CopySrc[2], cb->CopySrc[3]);
+                b.ClearColor = cb->ClearColor; b.ClearDepth = cb->ClearDepth;
                 for (int t = 0; t < 8; t++)
                 {
+                    b.CopyRefs[t] = cb->Textures[t] >= 0 && f->Textures[cb->Textures[t]].Rgba == null ? f->Textures[cb->Textures[t]].Id : 0;
                     b.Textures[t] = cb->Textures[t] >= 0 ? textures[cb->Textures[t]] : null;
                     b.TextureIds[t] = cb->Textures[t] >= 0 ? f->Textures[cb->Textures[t]].Id : 0;
                     b.Samplers[t] = Sampler(cb->Sampler[t]);
@@ -281,23 +316,61 @@ internal sealed class TurokGame : Game
         Copy(m->SwapTable, p.SwapTable); Copy(m->Regs, p.Regs); Copy(m->MapCoord, p.MapCoord);
         p.AlphaTest = new Vector4(m->AlphaTest[0], m->AlphaTest[1], m->AlphaTest[2], m->AlphaTest[3]);
         p.Misc = new Vector4(m->Misc[0], m->Misc[1], m->Misc[2], m->Misc[3]);
+        p.Fog = new Vector4(m->Fog[0], m->Fog[1], m->Fog[2], m->Fog[3]);
+        p.FogMode = new Vector4(m->FogMode[0], m->FogMode[1], m->FogMode[2], m->FogMode[3]);
+        p.FogColor = new Vector4(m->FogColor[0], m->FogColor[1], m->FogColor[2], 1);
         p.Blend = BlendFor(m->Blend);
         p.Depth = DepthFor(m->ZMode);
+        p.Cull = m->Cull;
     }
 
-    private unsafe Texture2D GetTexture(CoreTexture* t)
+    private unsafe Texture2D? GetTexture(CoreTexture* t)
     {
+        if (t->Rgba == null) return null;  // EFB copy: resolved when drawn
         if (_textures.TryGetValue(t->Id, out var e))
         {
             _textures[t->Id] = (e.Tex, _framesReceived);
             return e.Tex;
         }
-        var tex = new Texture2D(GraphicsDevice, (int)t->Width, (int)t->Height, false, SurfaceFormat.Color);
-        var pixels = new uint[t->Width * t->Height];
-        new ReadOnlySpan<uint>(t->Rgba, pixels.Length).CopyTo(pixels);
-        tex.SetData(pixels);
+        int w = (int)t->Width, h = (int)t->Height, given = (int)Math.Max(1u, t->Levels);
+        var tex = new Texture2D(GraphicsDevice, w, h, given > 1, SurfaceFormat.Color);
+        uint* src = t->Rgba;
+        uint[]? prev = null;
+        int pw = 0, ph = 0;
+        for (int l = 0; l < tex.LevelCount; l++)
+        {
+            int lw = Math.Max(1, w >> l), lh = Math.Max(1, h >> l);
+            uint[] level;
+            if (l < given)
+            {
+                level = new uint[lw * lh];
+                new ReadOnlySpan<uint>(src, level.Length).CopyTo(level);
+                src += level.Length;
+            }
+            else level = BoxDownsample(prev!, pw, ph, lw, lh);  // levels the game didn't supply
+            tex.SetData(l, null, level, 0, level.Length);
+            prev = level; pw = lw; ph = lh;
+        }
         _textures[t->Id] = (tex, _framesReceived);
         return tex;
+    }
+
+    private static uint[] BoxDownsample(uint[] src, int sw, int sh, int dw, int dh)
+    {
+        var dst = new uint[dw * dh];
+        for (int y = 0; y < dh; y++)
+            for (int x = 0; x < dw; x++)
+            {
+                uint r = 0, g = 0, b = 0, a = 0;
+                for (int k = 0; k < 4; k++)
+                {
+                    int sx = Math.Min(sw - 1, 2 * x + (k & 1)), sy = Math.Min(sh - 1, 2 * y + (k >> 1));
+                    uint p = src[sy * sw + sx];
+                    r += p & 0xFF; g += (p >> 8) & 0xFF; b += (p >> 16) & 0xFF; a += p >> 24;
+                }
+                dst[y * dw + x] = (r / 4) | (g / 4) << 8 | (b / 4) << 16 | (a / 4) << 24;
+            }
+        return dst;
     }
 
     private void PurgeTextures()
@@ -377,23 +450,90 @@ internal sealed class TurokGame : Game
         return s;
     }
 
-    // TX_SETMODE0: wrap s 0-1, wrap t 2-3 (0 clamp, 1 repeat, 2 mirror), bit4 linear mag filter
+    // TX_SETMODE0: wrap s 0-1, wrap t 2-3 (0 clamp, 1 repeat, 2 mirror), bit4 linear mag filter,
+    // min filter 5-7 (0 near, 1 near-mip-near, 2 near-mip-lin, 4 lin, 5 lin-mip-near, 6 lin-mip-lin),
+    // LOD bias 9-16 (signed, 1/32 units)
     private static SamplerState Sampler(uint mode)
     {
-        uint key = mode & 0x1F;
+        uint key = mode & 0x1FFFF;
         if (SamplerCache.TryGetValue(key, out var s)) return s;
         static TextureAddressMode Wrap(uint w) => w switch
         {
             1 => TextureAddressMode.Wrap, 2 => TextureAddressMode.Mirror, _ => TextureAddressMode.Clamp,
         };
+        bool mag = (mode & 16) != 0;
+        uint minf = (mode >> 5) & 7;
+        bool min = minf >= 4, mip = minf == 2 || minf == 6;
+        var filter = (min, mag, mip) switch
+        {
+            (true, true, true) => TextureFilter.Linear,
+            (true, true, false) => TextureFilter.LinearMipPoint,
+            (false, false, true) => TextureFilter.PointMipLinear,
+            (false, false, false) => TextureFilter.Point,
+            (true, false, true) => TextureFilter.MinLinearMagPointMipLinear,
+            (true, false, false) => TextureFilter.MinLinearMagPointMipPoint,
+            (false, true, true) => TextureFilter.MinPointMagLinearMipLinear,
+            _ => TextureFilter.MinPointMagLinearMipPoint,
+        };
         s = new SamplerState
         {
             AddressU = Wrap(mode & 3),
             AddressV = Wrap((mode >> 2) & 3),
-            Filter = (mode & 16) != 0 ? TextureFilter.Linear : TextureFilter.Point,
+            Filter = filter,
+            MipMapLevelOfDetailBias = (sbyte)((mode >> 9) & 0xFF) / 32f,
         };
         SamplerCache[key] = s;
         return s;
+    }
+
+    // ---- EFB -> texture copies ------------------------------------------------------------
+    private static readonly DepthStencilState ClearDepthState = new()
+    {
+        DepthBufferEnable = true, DepthBufferWriteEnable = true, DepthBufferFunction = CompareFunction.Always,
+    };
+
+    private void EfbCopy(Batch b)
+    {
+        var gd = GraphicsDevice;
+        var src = new Rectangle(b.CopySrc.X * RenderScale, b.CopySrc.Y * RenderScale,
+                                b.CopySrc.Width * RenderScale, b.CopySrc.Height * RenderScale);
+        src = Rectangle.Intersect(src, _target!.Bounds);
+        if (src.Width <= 0 || src.Height <= 0) return;
+        bool half = (b.CopyMode & 0x100) != 0;
+        int w = half ? Math.Max(1, src.Width / 2) : src.Width, h = half ? Math.Max(1, src.Height / 2) : src.Height;
+        if (!_efbCopies.TryGetValue(b.CopyId, out var rt) || rt.Width != w || rt.Height != h)
+        {
+            rt?.Dispose();
+            rt = new RenderTarget2D(gd, w, h, false, SurfaceFormat.Color, DepthFormat.None);
+            _efbCopies[b.CopyId] = rt;
+        }
+
+        gd.SetRenderTarget(rt);
+        _copyFx!.Parameters["Mode"].SetValue((float)(b.CopyMode & 0xFF));
+        _sprites!.Begin(SpriteSortMode.Immediate, BlendState.Opaque, SamplerState.LinearClamp,
+                        DepthStencilState.None, RasterizerState.CullNone, _copyFx);
+        _sprites.Draw(_target, new Rectangle(0, 0, w, h), src, Color.White);
+        _sprites.End();
+        gd.SetRenderTarget(_target);
+
+        if ((b.CopyMode & 0x200) != 0)
+        {
+            // Clear the copied rectangle to the clear colour / depth.
+            gd.Viewport = new Viewport(src.X, src.Y, src.Width, src.Height, 0f, 1f);
+            gd.ScissorRectangle = src;
+            gd.RasterizerState = Raster;
+            gd.BlendState = BlendState.Opaque;
+            gd.DepthStencilState = ClearDepthState;
+            var c = new Color(b.ClearColor);
+            float z = b.ClearDepth;
+            var quad = new[]
+            {
+                new VertexPositionColor(new Vector3(-1, -1, z), c), new VertexPositionColor(new Vector3(-1, 1, z), c),
+                new VertexPositionColor(new Vector3(1, -1, z), c), new VertexPositionColor(new Vector3(1, 1, z), c),
+            };
+            _clearFx!.CurrentTechnique.Passes[0].Apply();
+            gd.DrawUserPrimitives(PrimitiveType.TriangleStrip, quad, 0, 2);
+        }
     }
 
     // ---- rendering ---------------------------------------------------------------------
@@ -401,6 +541,17 @@ internal sealed class TurokGame : Game
     {
         CullMode = CullMode.None,
         ScissorTestEnable = true,
+    };
+    // GX GENMODE cull (hardware encoding): 0 none, 1 cull counter-clockwise, 2 cull clockwise
+    // (as seen in our D3D clip space), 3 all. Verified on the title scene: with 2 mapped the
+    // other way, palm trunks and cliffs lose their front faces.
+    // TUROK_CULL_FLIP=1 swaps the two windings (for re-verification).
+    private static readonly bool CullFlip = Environment.GetEnvironmentVariable("TUROK_CULL_FLIP") == "1";
+    private static readonly RasterizerState[] CullStates =
+    {
+        Raster,
+        new() { CullMode = CullFlip ? CullMode.CullClockwiseFace : CullMode.CullCounterClockwiseFace, ScissorTestEnable = true },
+        new() { CullMode = CullFlip ? CullMode.CullCounterClockwiseFace : CullMode.CullClockwiseFace, ScissorTestEnable = true },
     };
 
     protected override void Draw(GameTime gameTime)
@@ -415,8 +566,11 @@ internal sealed class TurokGame : Game
         var P = fx.Parameters;
         foreach (var b in _batches)
         {
+            if (b.Kind == 1) { EfbCopy(b); continue; }
             if (b.Count == 0 || b.Viewport.Width <= 0 || b.Viewport.Height <= 0) continue;
             var m = _materials[b.Material];
+            if (m.Cull == 3) continue;  // cull all
+            gd.RasterizerState = CullStates[m.Cull];
             gd.Viewport = new Viewport(b.Viewport.X, b.Viewport.Y, b.Viewport.Width, b.Viewport.Height, 0f, 1f);
             gd.ScissorRectangle = Rectangle.Intersect(b.Scissor, _target!.Bounds);
             gd.DepthStencilState = m.Depth;
@@ -428,8 +582,14 @@ internal sealed class TurokGame : Game
             P["Stage"].SetValue(m.Stage); P["Swap"].SetValue(m.Swap); P["Konst"].SetValue(m.Konst);
             P["SwapTable"].SetValue(m.SwapTable); P["Regs"].SetValue(m.Regs); P["MapCoord"].SetValue(m.MapCoord);
             P["AlphaTest"].SetValue(m.AlphaTest);
+            P["Fog"].SetValue(m.Fog); P["FogMode"].SetValue(m.FogMode); P["FogColor"].SetValue(m.FogColor);
             P["Misc"].SetValue(new Vector4(m.Misc.X, m.Misc.Y, _debugView, 0));
-            for (int t = 0; t < 8; t++) P["Tex" + t].SetValue(b.Textures[t] ?? _white);
+            for (int t = 0; t < 8; t++)
+            {
+                Texture2D? tex = b.Textures[t];
+                if (b.CopyRefs[t] != 0) tex = _efbCopies.TryGetValue(b.CopyRefs[t], out var rt) ? rt : null;
+                P["Tex" + t].SetValue(tex ?? _white);
+            }
 
             fx.CurrentTechnique.Passes[0].Apply();
             for (int t = 0; t < 8; t++) gd.SamplerStates[t] = b.Samplers[t];

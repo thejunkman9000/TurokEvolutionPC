@@ -20,6 +20,7 @@
 #include "core_api.h"
 
 uint32_t gx_bp(int reg);
+void gx_viewport_z(float *scale, float *offset);
 
 // TEV colour registers (11-bit signed) and konst registers (8-bit), RGBA.
 static int16_t s_tevreg[4][4];
@@ -122,6 +123,30 @@ uint32_t gx_material_build(CoreMaterial *m) {
     m->misc[0] = (float)((ac >> 22) & 3);
     m->misc[1] = (float)nstages;
 
+    // Fog. A and C are 20-bit floats: mantissa 0-10, exponent 11-18, sign 19.
+    {
+        uint32_t f0 = gx_bp(0xEE), f3 = gx_bp(0xF1), col = gx_bp(0xF2);
+        uint32_t ia = ((f0 >> 19) & 1) << 31 | ((f0 >> 11) & 0xFF) << 23 | (f0 & 0x7FF) << 12;
+        uint32_t ic = ((f3 >> 19) & 1) << 31 | ((f3 >> 11) & 0xFF) << 23 | (f3 & 0x7FF) << 12;
+        float a, c;
+        memcpy(&a, &ia, 4); memcpy(&c, &ic, 4);
+        m->fog[0] = a; m->fog[1] = c;
+        m->fog[2] = (float)(gx_bp(0xEF) & 0xFFFFFF);
+        m->fog[3] = (float)(gx_bp(0xF0) & 0x1F);
+        m->fog_mode[0] = (float)((f3 >> 21) & 7);
+        static uint32_t s_last_fog;
+        if (((f3 >> 21) & 7) && f3 != s_last_fog) {
+            static int budget = 10;
+            s_last_fog = f3;
+            if (budget-- > 0) logf_("[fog] fsel %u ortho %u a %g c %g b %u>>%u color %06X", (f3 >> 21) & 7, (f3 >> 20) & 1,
+                                    a, c, gx_bp(0xEF) & 0xFFFFFF, gx_bp(0xF0) & 0x1F, col & 0xFFFFFF);
+        }
+        m->fog_mode[1] = (float)((f3 >> 20) & 1);
+        gx_viewport_z(&m->fog_mode[2], &m->fog_mode[3]);
+        m->fog_color[0] = ((col >> 16) & 0xFF) / 255.0f;
+        m->fog_color[1] = ((col >> 8) & 0xFF) / 255.0f;
+        m->fog_color[2] = (col & 0xFF) / 255.0f;
+    }
     m->blend = gx_bp(0x41);
     m->zmode = gx_bp(0x40);
     m->cull = (gen >> 14) & 3;

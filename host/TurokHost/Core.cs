@@ -39,6 +39,7 @@ internal unsafe struct CoreMaterial
     public fixed float SwapTable[16], Regs[16], MapCoord[8];
     public fixed float AlphaTest[4], Misc[4];
     public uint Blend, ZMode, Cull, Reserved;
+    public fixed float Fog[4], FogMode[4], FogColor[4];
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 4)]
@@ -51,12 +52,17 @@ internal unsafe struct CoreBatch
     public fixed uint Sampler[8];  // raw TX_SETMODE0 per tex map
     public fixed int Viewport[4];  // x, y, w, h (EFB pixels)
     public fixed int Scissor[4];   // x0, y0, x1, y1
+    public uint Kind;              // 0 draw, 1 EFB-to-texture copy
+    public uint CopyId, CopyMode;  // CopyMode: CORE_COPY_* | 0x100 half | 0x200 clear
+    public fixed int CopySrc[4];   // x, y, w, h (EFB pixels)
+    public uint ClearColor;
+    public float ClearDepth;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 4)]
 internal unsafe struct CoreTexture
 {
-    public uint Id, Width, Height;
+    public uint Id, Width, Height, Levels;
     public uint* Rgba;
 }
 

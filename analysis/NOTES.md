@@ -85,13 +85,15 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
     - `turok_run.exe` writes `turok_audio.wav`; `tools/spectrogram.py` renders it.
   - Screenshots: F12, or `TUROK_SCREENSHOT=<frame>` (plus `TUROK_EXIT_AFTER_SCREENSHOT=1`).
   - Input: keyboard and XInput are mapped to GameCube pad bits in `core_set_pad`; the core's `PADRead` HLE (`hle_pad.c`) feeds them to the game.
-    - Keys: WASD = stick, Enter = Start, Space = A, Shift = B, E = X, Q = Y, Tab = Z, Z / left mouse = L / R, arrows = D-pad.
+    - Keys: WASD = stick, IJKL = C-stick, Enter = Start, Space = A, Shift = B, E = X, Q = Y, Tab = Z, Z / left mouse = L / R, arrows = D-pad.
   - Debug environment variables:
     - `TUROK_INPUT=frame:Button[:hold],...`: scripted input.
     - `TUROK_SCREENSHOT=f1,f2,...`: capture those frames.
     - `TUROK_GXDUMP=frame`: log every draw of that frame.
     - `TUROK_DUMP_TEXTURES=frame`: write that frame's textures plus `batches.txt`.
-    - `TUROK_DEBUG_VIEW=1|2|3`: stage-0 texture, UV, or lit color.
+    - `TUROK_DEBUG_VIEW=1|2|3|4`: stage-0 texture, UV, lit color, or fog amount.
+    - Stick tokens for `TUROK_INPUT`: `LX+` `LX-` `LY+` `LY-` `CX+` `CX-` `CY+` `CY-`.
+    - `TUROK_CULL_FLIP=1`: swap the cull windings.
     - Core only: `TUROK_ONLY_VAT=n` and `TUROK_LOG_REDIRECT=1`.
 - Hardware added for the renderer:
   - DVD interface backed by the ISO (`di.c`).
@@ -123,12 +125,21 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - This makes `GXBeginDisplayList` and `GXRedirectWriteGatherPipe` work. The game skins creatures on the CPU (`psq_st` to the gather pipe, redirected into vertex arrays).
   - Writing WPAR (`mtspr 921`) resets the gather pipe. Without this, redirected vertex data came out shifted by a byte and the skinned meshes turned into shards.
 - **Status: playable path from boot to level 1.** Legal screens, intro video (THP), title scene, main menu and New Game all work, with saves created on the emulated card and persisting across runs; screenshots are in `analysis/`.
+- **EFB→texture copies** (`gx_render.c` `efb_copy_to_texture`, host `EfbCopy`):
+  - A copy becomes a kind-1 batch in the frame. The host copies that region of the (content-preserving) EFB render target into a persistent per-address render target, with channel conversion (`Shaders/Copy.fx`: R/RA/A/G/B/intensity/RGB), then clears the rectangle to the clear color and depth.
+  - Texture reads at a copy's address return the copy, unless the CPU has since rewritten that memory (hash check).
+  - Turok renders its projected shadow map this way: 240×240 at (0,0), R4 format, to 0x006A97A0 every frame.
+- **Mipmaps:** chains are decoded when the min filter uses mips (level count from TX_SETMODE1 max LOD); the host box-filters any missing small levels. Min/mag/mip filter modes and LOD bias map to sampler states.
+- **Fog:** BP 0xEE-0xF2 are captured in the material, and the TEV shader rebuilds 24-bit window Z from the viewport Z scale/offset. All five GX falloff curves, perspective and ortho, follow Dolphin's formula. Level 1 uses linear perspective fog with a slowly changing color.
+- **Culling:** GENMODE 1 = cull counter-clockwise, 2 = cull clockwise, 3 = all. Verified on the title scene; `TUROK_CULL_FLIP=1` swaps it.
+- **Locked-cache DMA** (SPRs 922/923, with a physical memory address) is emulated. The THP video decoder needs it; without it the intro movie and credits video decoded to garbage.
+- The intro movie now plays (after boot, and after New Game), so scripted menu input needs a Start press to skip it, and menu timing varies between runs.
+- Soak test: 4¾ minutes of scripted play (walking, combat with damage taken, menus) with no crashes and no audio starvation.
 - Known gaps:
-  - Fog. Distant cliffs and canopy look speckled, probably from missing fog plus missing mipmaps on alpha-tested foliage.
-  - Indirect texturing (bump), EFB→texture copies, lines and points.
+  - Indirect texturing (bump), lines and points.
+  - Z-buffer EFB copies.
+  - Range-adjusted fog.
   - Audio: no polyphase resampling (it needs the DSP ROM coefficients; linear is used instead), no initial time delay (ITD), and no DVD streaming audio (AI streaming is untested).
-  - Culling is off, until the GX→D3D winding is verified in 3D scenes.
-  - The texture LOD/mipmap mode is ignored.
   - TEV math is float, not 8-bit integer.
 - GX bit layouts that bit me:
   - Clear color: AR = red bits 0-7, alpha bits 8-15. GB = blue bits 0-7, green bits 8-15.

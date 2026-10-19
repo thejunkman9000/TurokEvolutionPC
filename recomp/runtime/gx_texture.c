@@ -10,7 +10,7 @@ uint32_t gx_bp(int reg);
 uint8_t *gx_tlut_mem(void);
 
 typedef struct TexEntry {
-    uint32_t addr, fmt, w, h, tlut;   // key
+    uint32_t addr, fmt, w, h, tlut, levels;   // key
     uint64_t hash;                    // content (+ palette) hash
     uint32_t id;
     uint32_t *rgba;
@@ -31,7 +31,9 @@ static uint32_t c5a3(uint16_t c) {
 static uint32_t cia8(uint16_t c) { uint32_t i = c & 0xFF; return rgba(i, i, i, c >> 8); }
 
 // Size in bytes of a w x h texture of format fmt (blocks are 32 bytes).
-static uint32_t tex_bytes(uint32_t fmt, uint32_t w, uint32_t h) {
+uint32_t gx_tex_bytes(uint32_t fmt, uint32_t w, uint32_t h);
+static uint32_t tex_bytes(uint32_t fmt, uint32_t w, uint32_t h) { return gx_tex_bytes(fmt, w, h); }
+uint32_t gx_tex_bytes(uint32_t fmt, uint32_t w, uint32_t h) {
     uint32_t bw, bh;
     switch (fmt) {
     case 0: case 8: case 14: bw = 8; bh = 8; break;      // I4, C4, CMPR
@@ -118,11 +120,43 @@ static uint64_t hash_bytes(const uint8_t *p, uint32_t n, uint64_t h) {
     return h;
 }
 
+// ---- EFB copies --------------------------------------------------------------------
+// Copies stay on the host GPU (as in Dolphin's EFB-copy-to-texture). A texture
+// read at a copy's destination returns a reference to it, as long as the CPU
+// hasn't since rewritten that memory (detected by hashing it at copy time).
+typedef struct { uint32_t addr, id, w, h, bytes; uint64_t hash; } EfbCopy;
+static EfbCopy s_copies[64];
+static int s_ncopies;
+
+void gx_texture_register_efb_copy(uint32_t addr, uint32_t id, uint32_t w, uint32_t h, uint32_t bytes) {
+    EfbCopy *c = NULL;
+    for (int i = 0; i < s_ncopies; i++) if (s_copies[i].addr == addr) c = &s_copies[i];
+    if (!c) { if (s_ncopies == 64) s_ncopies = 0; c = &s_copies[s_ncopies++]; }
+    c->addr = addr; c->id = id; c->w = w; c->h = h; c->bytes = bytes;
+    c->hash = addr + bytes <= RAM_SIZE ? hash_bytes(g_ram + addr, bytes, 0) : 0;
+}
+
+static int efb_copy_lookup(uint32_t addr, CoreTexture *out) {
+    for (int i = 0; i < s_ncopies; i++) {
+        EfbCopy *c = &s_copies[i];
+        if (c->addr != addr) continue;
+        if (c->addr + c->bytes <= RAM_SIZE && hash_bytes(g_ram + c->addr, c->bytes, 0) != c->hash) {
+            c->addr = 0xFFFFFFFFu;  // CPU wrote a real texture here
+            return 0;
+        }
+        out->id = c->id; out->width = c->w; out->height = c->h; out->levels = 1; out->rgba = NULL;
+        return 1;
+    }
+    return 0;
+}
+
 // Look up / decode the texture bound to map 0..7.
 int gx_texture_for_map(int map, CoreTexture *out) {
     static const int img0[8] = {0x88, 0x89, 0x8A, 0x8B, 0xA8, 0xA9, 0xAA, 0xAB};
     static const int img3[8] = {0x94, 0x95, 0x96, 0x97, 0xB4, 0xB5, 0xB6, 0xB7};
     static const int tlr[8]  = {0x98, 0x99, 0x9A, 0x9B, 0xB8, 0xB9, 0xBA, 0xBB};
+    static const int mode0[8] = {0x80, 0x81, 0x82, 0x83, 0xA0, 0xA1, 0xA2, 0xA3};
+    static const int mode1[8] = {0x84, 0x85, 0x86, 0x87, 0xA4, 0xA5, 0xA6, 0xA7};
     uint32_t i0 = gx_bp(img0[map]);
     uint32_t w = (i0 & 0x3FF) + 1, h = ((i0 >> 10) & 0x3FF) + 1, fmt = (i0 >> 20) & 15;
     uint32_t addr = ((gx_bp(img3[map]) & 0xFFFFFF) << 5) & 0x01FFFFFF;
@@ -137,10 +171,25 @@ int gx_texture_for_map(int map, CoreTexture *out) {
         }
         return 0;
     }
-    uint32_t bytes = tex_bytes(fmt, w, h);
+    if (efb_copy_lookup(addr, out)) return 1;
+    // Mip chain: only when the min filter samples mips (near/lin _mip_ near/lin).
+    // Level count from TX_SETMODE1 max LOD (u4.4), stopping at 1x1.
+    uint32_t minf = (gx_bp(mode0[map]) >> 5) & 7, levels = 1;
+    if (minf == 1 || minf == 2 || minf == 5 || minf == 6) {
+        uint32_t max_lod = (gx_bp(mode1[map]) >> 8) & 0xFF;
+        levels = max_lod / 16 + 1;
+        uint32_t full = 1, m = w > h ? w : h;
+        while (m > 1) { m >>= 1; full++; }
+        if (levels > full) levels = full;
+    }
+    uint32_t bytes = 0, pixels = 0;
+    for (uint32_t l = 0; l < levels; l++) {
+        uint32_t lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1;
+        bytes += tex_bytes(fmt, lw, lh); pixels += lw * lh;
+    }
     if (addr + bytes > RAM_SIZE) return 0;
     const uint8_t *src = g_ram + addr;
-    uint64_t hash = hash_bytes(src, bytes, 0xCBF29CE484222325ull ^ fmt ^ ((uint64_t)w << 32 | h));
+    uint64_t hash = hash_bytes(src, bytes, 0xCBF29CE484222325ull ^ fmt ^ ((uint64_t)w << 32 | h) ^ ((uint64_t)levels << 56));
     if (fmt >= 8 && fmt <= 10) {
         uint32_t tmem = (tlut & 0x3FF) << 9, pal_bytes = fmt == 8 ? 32 : fmt == 9 ? 512 : 0x8000;
         if (tmem + pal_bytes <= 0x80000) hash = hash_bytes(gx_tlut_mem() + tmem, pal_bytes, hash ^ tlut);
@@ -148,19 +197,25 @@ int gx_texture_for_map(int map, CoreTexture *out) {
     uint32_t bucket = (addr >> 5) % TEX_BUCKETS;
     TexEntry *e;
     for (e = s_tex[bucket]; e; e = e->next)
-        if (e->addr == addr && e->fmt == fmt && e->w == w && e->h == h && e->hash == hash) break;
+        if (e->addr == addr && e->fmt == fmt && e->w == w && e->h == h && e->levels == levels && e->hash == hash) break;
     if (!e) {
         e = calloc(1, sizeof *e);
-        e->addr = addr; e->fmt = fmt; e->w = w; e->h = h; e->tlut = tlut; e->hash = hash;
+        e->addr = addr; e->fmt = fmt; e->w = w; e->h = h; e->tlut = tlut; e->hash = hash; e->levels = levels;
         e->id = s_next_id++;
-        e->rgba = malloc(w * h * 4);
-        decode(src, fmt, w, h, tlut, e->rgba);
+        e->rgba = malloc((size_t)pixels * 4);
+        const uint8_t *ls = src;
+        uint32_t *ld = e->rgba;
+        for (uint32_t l = 0; l < levels; l++) {
+            uint32_t lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1;
+            decode(ls, fmt, lw, lh, tlut, ld);
+            ls += tex_bytes(fmt, lw, lh); ld += lw * lh;
+        }
         static int s_log_budget = 400;
         if (s_log_budget > 0) { s_log_budget--; logf_("[tex] id %u fmt %u %ux%u addr %08X tlut %08X", e->id, fmt, w, h, addr, tlut); }
         e->next = s_tex[bucket]; s_tex[bucket] = e;
     }
     e->last_used = s_frame_counter;
-    out->id = e->id; out->width = w; out->height = h; out->rgba = e->rgba;
+    out->id = e->id; out->width = w; out->height = h; out->levels = levels; out->rgba = e->rgba;
     return 1;
 }
 

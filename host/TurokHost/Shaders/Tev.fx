@@ -22,6 +22,9 @@ float4 Regs[4];       // PREV, C0, C1, C2
 float4 MapCoord[2];   // texcoord index per tex map
 float4 AlphaTest;     // ref0, ref1, comp0, comp1
 float4 Misc;          // logic op, stage count, debug view
+float4 Fog;           // a, c, b magnitude, b shift
+float4 FogMode;       // fsel, ortho, viewport z scale, z offset
+float4 FogColor;
 
 Texture2D Tex0; sampler2D Samp0 = sampler_state { Texture = <Tex0>; };
 Texture2D Tex1; sampler2D Samp1 = sampler_state { Texture = <Tex1>; };
@@ -188,6 +191,26 @@ float4 MainPS(VSOut i) : COLOR0
     else if (Misc.x == 2.0) ok = p0 != p1;
     else ok = p0 == p1;
     if (!ok) clip(-1);
+
+    // Fog: rebuild 24-bit window Z (our clip z was remapped from GX [-w,0] to [0,w])
+    float fsel = FogMode.x;
+    if (fsel != 0.0)
+    {
+        float zs = clamp((i.Pos.z - 1.0) * FogMode.z + FogMode.w, 0.0, 16777215.0);
+        float ze;
+        if (FogMode.y == 0.0)  // perspective: A / (B_mag - (Zs >> B_shift))
+            ze = Fog.x * 16777216.0 / (Fog.z - floor(zs / exp2(Fog.w)));
+        else                   // orthographic: A * Zs
+            ze = Fog.x * zs / 16777216.0;
+        float f = saturate(ze - Fog.y);
+        if (fsel == 4.0) f = 1.0 - exp2(-8.0 * f);
+        else if (fsel == 5.0) f = 1.0 - exp2(-8.0 * f * f);
+        else if (fsel == 6.0) f = exp2(-8.0 * (1.0 - f));
+        else if (fsel == 7.0) { f = 1.0 - f; f = exp2(-8.0 * f * f); }
+        if (Misc.z == 4.0) return float4(f, f, f, 1);  // debug view 4: fog amount
+        result.rgb = lerp(saturate(result.rgb), FogColor.rgb, f);
+    }
+    else if (Misc.z == 4.0) return float4(0, 0, 0.25, 1);  // no fog on this draw
 
     return saturate(result);
 }

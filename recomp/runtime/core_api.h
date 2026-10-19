@@ -48,6 +48,10 @@ typedef struct CoreMaterial {
     uint32_t zmode;          // raw BP ZMODE
     uint32_t cull;           // 0 none, 1 back, 2 front, 3 all
     uint32_t reserved;
+    // Fog (BP 0xEE-0xF2) and what is needed to rebuild 24-bit window Z:
+    float fog[4];            // a, c, b_magnitude, b_shift
+    float fog_mode[4];       // fsel (0 off, 2 linear, 4 exp, 5 exp2, 6 bexp, 7 bexp2), ortho, z scale, z offset
+    float fog_color[4];      // rgb
 } CoreMaterial;
 
 typedef struct CoreBatch {
@@ -58,12 +62,26 @@ typedef struct CoreBatch {
     uint32_t sampler[8]; // per tex map: raw TX_SETMODE0 (wrap / filter)
     int32_t viewport[4]; // x, y, w, h in EFB pixels (640x528 space)
     int32_t scissor[4];  // x0, y0, x1, y1
+    // kind 1 = EFB-to-texture copy (no vertices): copy src rect into texture
+    // copy_id, converting channels per copy_mode, then optionally clear the rect.
+    uint32_t kind;
+    uint32_t copy_id;
+    uint32_t copy_mode;  // CORE_COPY_* channel conversion | 0x100 half scale | 0x200 clear
+    int32_t copy_src[4]; // x, y, w, h in EFB pixels
+    uint32_t clear_color;  // RGBA8
+    float clear_depth;     // 0..1
 } CoreBatch;
+
+// EFB copy channel conversions (what a texture read of the copy returns)
+enum { CORE_COPY_RGBA = 0, CORE_COPY_RRRR, CORE_COPY_RRRA, CORE_COPY_AAAA, CORE_COPY_GGGG, CORE_COPY_BBBB,
+       CORE_COPY_YYYY, CORE_COPY_YYYA, CORE_COPY_RGB1, CORE_COPY_RRRG, CORE_COPY_GGGB };
 
 typedef struct CoreTexture {
     uint32_t id;         // stable id for host-side caching
     uint32_t width, height;
-    const uint32_t *rgba;  // RGBA8 pixels, valid until the frame is released
+    uint32_t levels;     // mip levels in rgba (level 0 first, each half the size, min 1x1)
+    const uint32_t *rgba;  // RGBA8 pixels, valid until the frame is released;
+                           // NULL = the EFB copy with this id (made by a kind-1 batch)
 } CoreTexture;
 
 typedef struct CoreFrame {

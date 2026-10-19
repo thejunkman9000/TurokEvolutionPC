@@ -125,6 +125,11 @@ static void *grow(void *p, uint32_t *cap, uint32_t need, size_t elem) {
 static void slot_reset(FrameSlot *s) { s->nvtx = s->nbat = s->ntex = s->nmat = 0; }
 
 uint8_t *gx_tlut_mem(void) { return s_tmem_tlut; }
+// XF viewport Z scale/offset (window Z = ndc_z * scale + offset, 24-bit units)
+void gx_viewport_z(float *scale, float *offset) {
+    memcpy(scale, &xf_reg[XF_VIEWPORT + 2], 4);
+    memcpy(offset, &xf_reg[XF_VIEWPORT + 5], 4);
+}
 uint32_t gx_bp(int reg) { return bp[reg & 0xFF]; }
 
 static int32_t frame_texture(int map) {
@@ -166,6 +171,48 @@ static void publish_frame(void) {
     gx_texture_end_frame();
 }
 
+// ---- EFB -> texture copy ---------------------------------------------------------------
+void gx_texture_register_efb_copy(uint32_t addr, uint32_t id, uint32_t w, uint32_t h, uint32_t bytes);
+uint32_t gx_tex_bytes(uint32_t fmt, uint32_t w, uint32_t h);
+
+static void efb_copy_to_texture(uint32_t v) {
+    uint32_t tl = bp[0x49], wh = bp[0x4A];
+    int32_t x = tl & 0x3FF, y = (tl >> 10) & 0x3FF, w = (wh & 0x3FF) + 1, h = ((wh >> 10) & 0x3FF) + 1;
+    uint32_t dst = ((bp[0x4B] & 0xFFFFFF) << 5) & 0x01FFFFFF;
+    uint32_t tf = (v >> 3) & 15, fmt = (tf >> 1) | ((tf & 1) << 3);
+    int intensity = (v >> 15) & 1, half = (v >> 9) & 1, clear = (v >> 11) & 1;
+    uint32_t mode;
+    switch (fmt) {
+    case 0: case 1: case 8: mode = intensity ? CORE_COPY_YYYY : CORE_COPY_RRRR; break;  // R4 / R8
+    case 2: case 3: mode = intensity ? CORE_COPY_YYYA : CORE_COPY_RRRA; break;          // RA4 / RA8
+    case 4: mode = CORE_COPY_RGB1; break;                                               // RGB565
+    case 7: mode = CORE_COPY_AAAA; break;                                               // A8
+    case 9: mode = CORE_COPY_GGGG; break;
+    case 10: mode = CORE_COPY_BBBB; break;
+    case 11: mode = CORE_COPY_RRRG; break;
+    case 12: mode = CORE_COPY_GGGB; break;
+    default: mode = CORE_COPY_RGBA; break;                                              // RGB5A3 / RGBA8
+    }
+    uint32_t id = 0x80000000u | (dst >> 5);
+    uint32_t tw = half ? (uint32_t)w / 2 : (uint32_t)w, th = half ? (uint32_t)h / 2 : (uint32_t)h;
+    // texture format a later read is likely to use (only sizes the hashed region)
+    static const uint8_t tex_fmt_for_copy[16] = {0, 1, 2, 3, 4, 5, 6, 1, 1, 1, 1, 3, 3, 0, 0, 0};
+    gx_texture_register_efb_copy(dst, id, tw, th, gx_tex_bytes(tex_fmt_for_copy[fmt], tw, th));
+
+    CoreBatch b;
+    memset(&b, 0, sizeof b);
+    b.kind = 1;
+    b.copy_id = id;
+    b.copy_mode = mode | (half ? 0x100u : 0) | (clear ? 0x200u : 0);
+    b.copy_src[0] = x; b.copy_src[1] = y; b.copy_src[2] = w; b.copy_src[3] = h;
+    b.clear_color = s_clear_color;
+    b.clear_depth = (bp[0x51] & 0xFFFFFF) / 16777215.0f;
+    b.first_vertex = s_build->nvtx;
+    for (int i = 0; i < 8; i++) b.textures[i] = -1;
+    s_build->bat = grow(s_build->bat, &s_build->capbat, s_build->nbat + 1, sizeof(CoreBatch));
+    s_build->bat[s_build->nbat++] = b;
+}
+
 // ---- BP ---------------------------------------------------------------------------------
 void gx_bp_write(uint32_t v) {
     uint8_t reg = v >> 24;
@@ -183,8 +230,9 @@ void gx_bp_write(uint32_t v) {
         s_clear_color = (ar & 0xFF) | ((gb >> 8) & 0xFF) << 8 | (gb & 0xFF) << 16 | ((ar >> 8) & 0xFF) << 24;
         break;
     }
-    case 0x52:  // EFB copy: bit 14 set = copy to XFB (display)
+    case 0x52:  // EFB copy: bit 14 set = copy to XFB (display), else to a texture
         if (v & (1u << 14)) publish_frame();
+        else efb_copy_to_texture(v);
         break;
     case 0x65: {  // LOADTLUT1: copy palette from RAM into TMEM
         uint32_t src = ((bp[0x64] & 0xFFFFFF) << 5) & 0x01FFFFFF;
@@ -565,9 +613,10 @@ void gx_draw(uint8_t op, uint32_t count, const uint8_t *data) {
     if (s_only_vat >= 0 && vat != s_only_vat) return;
 
     CoreBatch st;
+    memset(&st, 0, sizeof st);  // kind 0 = draw; copy fields unused
     current_state(&st);
     CoreBatch *last = s_build->nbat ? &s_build->bat[s_build->nbat - 1] : NULL;
-    if (!last || !same_state(last, &st) || last->first_vertex + last->vertex_count != s_build->nvtx) {
+    if (!last || last->kind != 0 || !same_state(last, &st) || last->first_vertex + last->vertex_count != s_build->nvtx) {
         s_build->bat = grow(s_build->bat, &s_build->capbat, s_build->nbat + 1, sizeof(CoreBatch));
         st.first_vertex = s_build->nvtx; st.vertex_count = 0;
         s_build->bat[s_build->nbat++] = st;

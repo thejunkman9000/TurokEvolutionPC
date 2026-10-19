@@ -20,9 +20,13 @@
   <!-- TEV shader: compiled with mgfxc (tools/bin/dotnet) and embedded. -->
   <ItemGroup>
     <EmbeddedResource Include="Shaders/Tev.mgfxo" LogicalName="Tev.mgfxo" />
+    <EmbeddedResource Include="Shaders/Copy.mgfxo" LogicalName="Copy.mgfxo" />
   </ItemGroup>
-  <Target Name="CompileShaders" BeforeTargets="BeforeBuild" Inputs="Shaders/Tev.fx" Outputs="Shaders/Tev.mgfxo">
+  <Target Name="CompileTevShader" BeforeTargets="BeforeBuild" Inputs="Shaders/Tev.fx" Outputs="Shaders/Tev.mgfxo">
     <Exec Command="&quot;$(MSBuildProjectDirectory)/../../tools/bin/dotnet/mgfxc.exe&quot; Shaders/Tev.fx Shaders/Tev.mgfxo /Profile:DirectX_11" />
+  </Target>
+  <Target Name="CompileCopyShader" BeforeTargets="BeforeBuild" Inputs="Shaders/Copy.fx" Outputs="Shaders/Copy.mgfxo">
+    <Exec Command="&quot;$(MSBuildProjectDirectory)/../../tools/bin/dotnet/mgfxc.exe&quot; Shaders/Copy.fx Shaders/Copy.mgfxo /Profile:DirectX_11" />
   </Target>
 
   <!-- The recompiled game (built by CMake into recomp/build). -->

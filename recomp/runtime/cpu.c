@@ -78,6 +78,21 @@ uint32_t ppc_mfspr(PPCContext *c, int spr) {
 void ppc_mtspr(PPCContext *c, int spr, uint32_t v) {
     c->spr[spr & 1023] = v;
     if (spr == 921) gx_gather_reset();
+    if (spr == 923 && (v & 2)) {
+        // Locked-cache DMA (used by the THP video decoder). DMA_U: length high
+        // bits 0-4, memory address bits 5-31; DMA_L: trigger bit 1, length low
+        // bits 2-3, direction bit 4 (1 = memory -> cache), cache address 5-31.
+        // Length is in 32-byte lines (0 = 128). Completes instantly.
+        uint32_t u = c->spr[922];
+        uint32_t lines = ((u & 0x1F) << 2) | ((v >> 2) & 3);
+        if (!lines) lines = 128;
+        uint32_t mem = 0x80000000u | (u & 0x01FFFFE0u), lc = v & ~0x1Fu;  // memory side is physical
+        for (uint32_t i = 0; i < lines * 32; i += 4) {
+            if (v & 0x10) wr32(lc + i, rd32(mem + i));
+            else wr32(mem + i, rd32(lc + i));
+        }
+        c->spr[923] = v & ~2u;  // trigger clears when done
+    }
     if (spr == 22) {  // remember when DEC was written
         uint64_t now = host_time_ticks();
         c->spr[1022] = (uint32_t)now; c->spr[1023] = (uint32_t)(now >> 32);
