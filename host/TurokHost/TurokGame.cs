@@ -12,7 +12,13 @@ namespace TurokHost;
 
 internal sealed class TurokGame : Game
 {
-    private const int EfbWidth = 640, EfbHeight = 480;
+    private const int EfbHeight = 480;
+    // EFB width: 640 (4:3), or 854 with --widescreen. In widescreen, full-width perspective
+    // draws are stretched to the wide EFB with a narrower projection (same vertical FOV,
+    // more horizontally); everything else (HUD, 2D, shadow pass) stays 4:3, centered.
+    private readonly int EfbWidth;
+    private readonly float _wideFactor;
+    private readonly int _centerOff;
     private readonly int RenderScale;  // internal resolution = 640x480 * RenderScale
 
     private readonly GraphicsDeviceManager _graphics;
@@ -84,17 +90,20 @@ internal sealed class TurokGame : Game
         public uint Cull;
     }
 
-    public sealed record Options(int Scale = 2, bool Fullscreen = false, bool VSync = true);
+    public sealed record Options(int Scale = 2, bool Fullscreen = false, bool VSync = true, bool Widescreen = false);
 
     public TurokGame(string isoPath, Options? options = null)
     {
         options ??= new Options();
         _isoPath = isoPath;
         RenderScale = Math.Clamp(options.Scale, 1, 4);
+        EfbWidth = options.Widescreen ? 854 : 640;
+        _wideFactor = EfbWidth / 640f;
+        _centerOff = (EfbWidth - 640) / 2;
         _graphics = new GraphicsDeviceManager(this)
         {
-            PreferredBackBufferWidth = 1280,
-            PreferredBackBufferHeight = 960,
+            PreferredBackBufferWidth = options.Widescreen ? 1280 : 1280,
+            PreferredBackBufferHeight = options.Widescreen ? 720 : 960,
             SynchronizeWithVerticalRetrace = options.VSync,
             HardwareModeSwitch = false,  // borderless fullscreen
             IsFullScreen = options.Fullscreen,
@@ -240,6 +249,10 @@ internal sealed class TurokGame : Game
         base.Update(gameTime);
     }
 
+    // EFB x coordinate / width in the (possibly widescreen) render target
+    private int MapX(int x, bool widen) => widen ? (int)MathF.Round(x * _wideFactor) : x + _centerOff;
+    private int MapW(int w, bool widen) => widen ? (int)MathF.Round(w * _wideFactor) : w;
+
     // ---- audio -----------------------------------------------------------------------
     private readonly Queue<short> _audioQueue = new();
     private int _audioSubmitted, _audioStarved;
@@ -324,7 +337,8 @@ internal sealed class TurokGame : Game
                 b.First = (int)cb->FirstVertex; b.Count = (int)cb->VertexCount;
                 b.Material = (int)cb->Material;
                 b.Kind = cb->Kind; b.CopyId = cb->CopyId; b.CopyMode = cb->CopyMode;
-                b.CopySrc = new Rectangle(cb->CopySrc[0], cb->CopySrc[1], cb->CopySrc[2], cb->CopySrc[3]);
+                bool wideCopy = _centerOff != 0 && cb->CopySrc[0] <= 0 && cb->CopySrc[2] >= 600;
+                b.CopySrc = new Rectangle(MapX(cb->CopySrc[0], wideCopy), cb->CopySrc[1], MapW(cb->CopySrc[2], wideCopy), cb->CopySrc[3]);
                 b.ClearColor = cb->ClearColor; b.ClearDepth = cb->ClearDepth;
                 for (int t = 0; t < 8; t++)
                 {
@@ -333,11 +347,21 @@ internal sealed class TurokGame : Game
                     b.TextureIds[t] = cb->Textures[t] >= 0 ? f->Textures[cb->Textures[t]].Id : 0;
                     b.Samplers[t] = Sampler(cb->Sampler[t]);
                 }
-                b.Viewport = new Rectangle(cb->Viewport[0] * RenderScale, cb->Viewport[1] * RenderScale,
-                                           cb->Viewport[2] * RenderScale, cb->Viewport[3] * RenderScale);
-                b.Scissor = new Rectangle(cb->Scissor[0] * RenderScale, cb->Scissor[1] * RenderScale,
-                                          (cb->Scissor[2] - cb->Scissor[0]) * RenderScale,
-                                          (cb->Scissor[3] - cb->Scissor[1]) * RenderScale);
+                bool perspective = m[15] == 0f;
+                bool widen = _centerOff != 0 && perspective && cb->Viewport[0] <= 16 && cb->Viewport[2] >= 600;
+                if (widen)
+                {
+                    // narrower x projection so the wider viewport isn't stretched
+                    float k = 1f / _wideFactor;
+                    b.Projection.M11 *= k; b.Projection.M21 *= k; b.Projection.M31 *= k; b.Projection.M41 *= k;
+                }
+                b.Viewport = new Rectangle(MapX(cb->Viewport[0], widen) * RenderScale, cb->Viewport[1] * RenderScale,
+                                           MapW(cb->Viewport[2], widen) * RenderScale, cb->Viewport[3] * RenderScale);
+                bool fullScissor = cb->Scissor[0] <= 0 && cb->Scissor[2] >= 640;
+                int sx0 = widen && fullScissor ? 0 : MapX(cb->Scissor[0], widen);
+                int sx1 = widen && fullScissor ? EfbWidth : MapX(cb->Scissor[2], widen);
+                b.Scissor = new Rectangle(sx0 * RenderScale, cb->Scissor[1] * RenderScale,
+                                          (sx1 - sx0) * RenderScale, (cb->Scissor[3] - cb->Scissor[1]) * RenderScale);
             }
         }
         finally

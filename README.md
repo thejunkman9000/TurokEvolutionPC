@@ -32,12 +32,12 @@ host\TurokHost\bin\Release\net9.0-windows\TurokEvolution.exe "D:\Games\Turok - E
 ```
 
 Options: `--fullscreen`, `--scale 1..4` (internal resolution, multiples of 640x480; default 2),
-`--no-vsync`. If the `.iso` sits next to the executable (or a few folders above it) the path can be omitted.
+`--widescreen` (16:9: the 3D view gets wider, HUD and menus stay 4:3), `--no-vsync`. If the `.iso` sits next to the executable (or a few folders above it) the path can be omitted.
 
 | Action | Keyboard / mouse | Xbox controller |
 |---|---|---|
 | Move | W A S D | left stick |
-| Look | mouse, or I J K L | right stick |
+| Look | mouse (click to capture, Esc to release), or I J K L | right stick |
 | Fire (R) | left mouse button | right trigger |
 | L | right mouse button / Z | left trigger |
 | A / B / X / Y | Space / Shift / E / Q | A / B / X / Y |

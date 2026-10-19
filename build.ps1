@@ -42,9 +42,20 @@ if (-not $vs) { throw 'Visual Studio C++ tools not found (install "Desktop devel
 $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
 $cmakeDir = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake'
 if ($Clean -and (Test-Path recomp/build)) { Remove-Item -Recurse -Force recomp/build }
-$cmd = "call `"$vcvars`" >nul && set `"PATH=$cmakeDir\Ninja;$cmakeDir\CMake\bin;%PATH%`" && " +
-       "cmake -S recomp -B recomp\build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C recomp\build"
-cmd /c $cmd
+# Run through a temporary .cmd: passing quoted && chains via `cmd /c` from PowerShell is fragile.
+# vcvars64.bat itself calls vswhere, so the Installer folder goes on PATH first.
+$installer = Split-Path $vswhere
+$script = Join-Path $env:TEMP 'turok_native_build.cmd'
+@"
+@echo off
+set "PATH=$installer;%PATH%"
+call "$vcvars" >nul || exit /b 1
+set "PATH=$cmakeDir\Ninja;$cmakeDir\CMake\bin;%PATH%"
+cd /d "$root"
+cmake -S recomp -B recomp\build -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
+ninja -C recomp\build || exit /b 1
+"@ | Set-Content -Encoding ascii $script
+cmd /c "`"$script`""
 if ($LASTEXITCODE) { throw 'native build failed' }
 
 # 4. shader compiler + MonoGame host

@@ -144,7 +144,10 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - Indirect stages are sampled at shifted coordinates, then each stage's format, bias and bump alpha are applied, followed by the static or S/T-dynamic matrices and the wrap/add-previous steps, with s24 wrap.
   - Stages sample with explicit gradients. Setup-unit texcoord sizes come from BP 0x30+.
   - Used by about 25 draws per frame in level 1 (the river by the bridge). Not visually verified yet. `TUROK_DEBUG_VIEW=5` shows indirect draws in magenta.
-- **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--no-vsync]`. F11 or Alt+Enter toggles borderless fullscreen.
+- **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--widescreen] [--no-vsync]`. F11 or Alt+Enter toggles borderless fullscreen.
+- **Widescreen:** the EFB is 854 wide. Perspective draws whose viewport spans the full 640 width are stretched across it, with the projection's X row scaled by 640/854. Every other draw, and any EFB copy narrower than full width (such as the shadow map), stays 4:3 and is shifted to the center.
+- **Mouse look:** click to capture the mouse, Esc to release. Motion maps to C-stick deflection, and left/right buttons map to R/L.
+- **Build:** `build.ps1 -Iso <path>` builds a clean clone end to end (verified): extract the DOL, generate C, MSVC via vswhere + CMake/Ninja (run through a temporary .cmd), install mgfxc locally, build the host.
 - Known gaps:
   - Lines and points (not used in level 1).
   - Z-buffer EFB copies.
