@@ -1,0 +1,31 @@
+# SDK / game functions replaced by host implementations in runtime/hle.c.
+# One symbol name (from decomp/config/GTKE51/symbols.txt) or address per line.
+# The recompiled original stays available as orig_XXXXXXXX.
+
+# Boot-time DSP handshake (uploads a tiny DSP program, waits on mailboxes).
+__OSInitAudioSystem
+__OSStopAudioSystem
+
+# Context switching: see runtime/irq.c.
+OSLoadContext
+
+# Controller input from the host: runtime/hle_pad.c.
+PADRead
+
+# Memory card in slot A backed by GCI files: runtime/hle_card.c.
+CARDInit
+CARDProbeEx
+CARDMountAsync
+CARDUnmount
+CARDFreeBlocks
+CARDOpen
+CARDClose
+CARDCreate
+CARDReadAsync
+CARDWriteAsync
+CARDGetStatus
+CARDSetStatus
+80122F24  # CARDGetResultCode
+80124708  # CARDCheckAsync
+80125914  # CARDFormat
+80126950  # CARDDeleteAsync

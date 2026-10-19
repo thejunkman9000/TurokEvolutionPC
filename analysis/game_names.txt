@@ -1,0 +1,13 @@
+OK  8007d618 fn_8007D618              Font::loadx1
+OK  8007e73c fn_8007E73C              Iff::Iffx4
+OK  8007eb70 fn_8007EB70              Iff::seekChunkx1
+OK  8007ed3c fn_8007ED3C              Iff::seekChunkx1
+OK  8007ee68 fn_8007EE68              Iff::seekChunkx1
+MULTI 8007ef70 fn_8007EF70              Iff::readMiscx1 | Iff::Iffx1
+OK  8007f5ac fn_8007F5AC              Iff::chunkLengthx1
+OK  800ee048 fn_800EE048              CScreenSprite::ComputePositionx1
+OK  80108264 fn_80108264              CDynamicMeshResource::Loadx1
+OK  8010a39c fn_8010A39C              GC_MPEG::Removex1
+OK  8010a3fc fn_8010A3FC              GC_MPEG::Unloadx1
+OK  801b42c4 fn_801B42C4              CTurokPickup::Upgradex1
+OK  80208b40 fn_80208B40              CLastManeMode::RespawnPickupsx1

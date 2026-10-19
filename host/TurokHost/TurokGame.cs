@@ -1,0 +1,478 @@
+// MonoGame host: runs turok_core.dll and draws the frames it publishes with
+// the TEV ubershader (Shaders/Tev.fx).
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using Microsoft.Xna.Framework.Audio;
+using Microsoft.Xna.Framework.Input;
+
+namespace TurokHost;
+
+internal sealed class TurokGame : Game
+{
+    private const int EfbWidth = 640, EfbHeight = 480;
+    private const int RenderScale = 2;
+
+    private readonly GraphicsDeviceManager _graphics;
+    private readonly string _isoPath;
+    private RenderTarget2D? _target;
+    private SpriteBatch? _sprites;
+    private Effect? _tev;
+    private Texture2D? _white;
+
+    // Last frame copied out of the core (redrawn until a newer one arrives).
+    private TevVertex[] _vertices = Array.Empty<TevVertex>();
+    private readonly List<Batch> _batches = new();
+    private readonly List<MaterialParams> _materials = new();
+    private Color _clearColor = Color.Black;
+    private uint _lastSerial;
+    private int _framesReceived;
+
+    private readonly Dictionary<uint, (Texture2D Tex, int LastUsed)> _textures = new();
+
+    // Audio: the core's AI DMA output, streamed through a DynamicSoundEffectInstance.
+    private DynamicSoundEffectInstance? _sound;
+    private int _soundRate;
+    private readonly short[] _audioFrames = new short[32000 * 2];
+    private const int AudioChunkFrames = 1600;  // 50 ms at 32 kHz
+
+    private string _status = "starting";
+    private readonly float _debugView = float.TryParse(Environment.GetEnvironmentVariable("TUROK_DEBUG_VIEW"), out var dv) ? dv : 0;
+    private readonly List<int> _screenshotFrames = new();
+    private bool _screenshotPending;
+    private readonly List<(int Frame, PadButtons Button, int Hold)> _script = new();
+
+    private sealed class Batch
+    {
+        public Matrix Projection;
+        public int First, Count;
+        public int Material;
+        public readonly Texture2D?[] Textures = new Texture2D?[8];
+        public readonly SamplerState[] Samplers = new SamplerState[8];
+        public Rectangle Viewport, Scissor;
+        public readonly uint[] TextureIds = new uint[8];
+    }
+
+    // A CoreMaterial converted to effect parameter arrays and state objects.
+    private sealed class MaterialParams
+    {
+        public readonly Vector4[] ColorIn = new Vector4[16], AlphaIn = new Vector4[16];
+        public readonly Vector4[] ColorOp = new Vector4[16], AlphaOp = new Vector4[16];
+        public readonly Vector4[] Stage = new Vector4[16], Swap = new Vector4[16], Konst = new Vector4[16];
+        public readonly Vector4[] SwapTable = new Vector4[4], Regs = new Vector4[4], MapCoord = new Vector4[2];
+        public Vector4 AlphaTest, Misc;
+        public BlendState Blend = BlendState.Opaque;
+        public DepthStencilState Depth = DepthStencilState.None;
+    }
+
+    public TurokGame(string isoPath)
+    {
+        _isoPath = isoPath;
+        _graphics = new GraphicsDeviceManager(this)
+        {
+            PreferredBackBufferWidth = 1280,
+            PreferredBackBufferHeight = 960,
+            SynchronizeWithVerticalRetrace = true,
+            GraphicsProfile = GraphicsProfile.HiDef,
+        };
+        IsMouseVisible = true;
+        Window.AllowUserResizing = true;
+        Window.Title = "Turok: Evolution (recompiled)";
+        // TUROK_SCREENSHOT=120,400,...: capture those frames (exit after the last
+        // one if TUROK_EXIT_AFTER_SCREENSHOT=1).
+        foreach (var part in (Environment.GetEnvironmentVariable("TUROK_SCREENSHOT") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
+            if (int.TryParse(part, out var n)) _screenshotFrames.Add(n);
+        // TUROK_INPUT=frame:Button[:holdFrames],...  e.g. "150:Down:4,200:A:6"
+        foreach (var part in (Environment.GetEnvironmentVariable("TUROK_INPUT") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var f = part.Split(':');
+            if (f.Length >= 2 && int.TryParse(f[0], out var at) && Enum.TryParse<PadButtons>(f[1], true, out var btn))
+                _script.Add((at, btn, f.Length > 2 && int.TryParse(f[2], out var h) ? h : 6));
+        }
+    }
+
+    protected override void Initialize()
+    {
+        base.Initialize();
+        if (!Core.Start(_isoPath, "turok_recomp.log"))
+        {
+            Core.State(out var msg);
+            _status = "failed to start: " + msg;
+        }
+    }
+
+    protected override void LoadContent()
+    {
+        _target = new RenderTarget2D(GraphicsDevice, EfbWidth * RenderScale, EfbHeight * RenderScale, false,
+                                     SurfaceFormat.Color, DepthFormat.Depth24Stencil8);
+        _sprites = new SpriteBatch(GraphicsDevice);
+        using (var s = typeof(TurokGame).Assembly.GetManifestResourceStream("Tev.mgfxo")!)
+        using (var ms = new MemoryStream())
+        {
+            s.CopyTo(ms);
+            _tev = new Effect(GraphicsDevice, ms.ToArray());
+        }
+        _white = new Texture2D(GraphicsDevice, 1, 1);
+        _white.SetData(new[] { Color.White });
+    }
+
+    // ---- input ---------------------------------------------------------------------
+    protected override void Update(GameTime gameTime)
+    {
+        var kb = Keyboard.GetState();
+        var gp = GamePad.GetState(PlayerIndex.One);
+        if (kb.IsKeyDown(Keys.F12)) _screenshotPending = true;
+
+        PadButtons b = 0;
+        void Map(bool down, PadButtons button) { if (down) b |= button; }
+        Map(kb.IsKeyDown(Keys.Enter) || gp.Buttons.Start == ButtonState.Pressed, PadButtons.Start);
+        Map(kb.IsKeyDown(Keys.Space) || gp.Buttons.A == ButtonState.Pressed, PadButtons.A);
+        Map(kb.IsKeyDown(Keys.LeftShift) || gp.Buttons.B == ButtonState.Pressed, PadButtons.B);
+        Map(kb.IsKeyDown(Keys.E) || gp.Buttons.X == ButtonState.Pressed, PadButtons.X);
+        Map(kb.IsKeyDown(Keys.Q) || gp.Buttons.Y == ButtonState.Pressed, PadButtons.Y);
+        Map(kb.IsKeyDown(Keys.Tab) || gp.Buttons.RightShoulder == ButtonState.Pressed, PadButtons.Z);
+        Map(kb.IsKeyDown(Keys.Up) || gp.DPad.Up == ButtonState.Pressed, PadButtons.Up);
+        Map(kb.IsKeyDown(Keys.Down) || gp.DPad.Down == ButtonState.Pressed, PadButtons.Down);
+        Map(kb.IsKeyDown(Keys.Left) || gp.DPad.Left == ButtonState.Pressed, PadButtons.Left);
+        Map(kb.IsKeyDown(Keys.Right) || gp.DPad.Right == ButtonState.Pressed, PadButtons.Right);
+
+        float lx = gp.ThumbSticks.Left.X, ly = gp.ThumbSticks.Left.Y;
+        if (kb.IsKeyDown(Keys.A)) lx = -1; if (kb.IsKeyDown(Keys.D)) lx = 1;
+        if (kb.IsKeyDown(Keys.W)) ly = 1;  if (kb.IsKeyDown(Keys.S)) ly = -1;
+        float lt = Math.Max(gp.Triggers.Left, kb.IsKeyDown(Keys.Z) ? 1f : 0f);
+        float rt = Math.Max(gp.Triggers.Right, Mouse.GetState().LeftButton == ButtonState.Pressed ? 1f : 0f);
+        if (lt > 0.9f) b |= PadButtons.L;
+        if (rt > 0.9f) b |= PadButtons.R;
+        foreach (var (frame, button, hold) in _script)
+            if (_framesReceived >= frame && _framesReceived < frame + hold) b |= button;
+        static sbyte Axis(float v) => (sbyte)Math.Clamp((int)(v * 100), -100, 100);
+        Core.SetPad(0, (ushort)b, Axis(lx), Axis(ly), Axis(gp.ThumbSticks.Right.X), Axis(gp.ThumbSticks.Right.Y),
+                    (byte)(lt * 255), (byte)(rt * 255));
+
+        PumpAudio();
+
+        var st = Core.State(out var msg);
+        _status = st switch
+        {
+            CoreState.Failed => "core stopped: " + msg,
+            CoreState.Exited => "game exited",
+            CoreState.Running => $"running - frame {_framesReceived}",
+            _ => _status,
+        };
+        Window.Title = "Turok: Evolution (recompiled) - " + _status;
+        base.Update(gameTime);
+    }
+
+    // ---- audio -----------------------------------------------------------------------
+    private readonly Queue<short> _audioQueue = new();
+    private int _audioSubmitted, _audioStarved;
+
+    private unsafe void PumpAudio()
+    {
+        int rate = Core.AudioRate();
+        if (_sound == null || rate != _soundRate)
+        {
+            _sound?.Dispose();
+            _sound = new DynamicSoundEffectInstance(rate, AudioChannels.Stereo);
+            _soundRate = rate;
+            _sound.Play();
+        }
+        // Drain everything the core produced since last time.
+        int n;
+        do
+        {
+            fixed (short* p = _audioFrames) n = Core.ReadAudio(p, _audioFrames.Length / 2);
+            for (int i = 0; i < 2 * n; i++) _audioQueue.Enqueue(_audioFrames[i]);
+        } while (n == _audioFrames.Length / 2);
+
+        // If we fell behind (clock drift, a stall), drop the oldest audio to keep latency low.
+        int maxSamples = rate / 4 * 2;  // 250 ms of stereo samples
+        while (_audioQueue.Count > maxSamples) { _audioQueue.Dequeue(); _audioQueue.Dequeue(); }
+
+        while (_sound.PendingBufferCount < 3 && _audioQueue.Count >= AudioChunkFrames * 2)
+        {
+            var bytes = new byte[AudioChunkFrames * 4];
+            for (int i = 0; i < AudioChunkFrames * 2; i++)
+            {
+                short v = _audioQueue.Dequeue();
+                bytes[2 * i] = (byte)v; bytes[2 * i + 1] = (byte)(v >> 8);
+            }
+            _sound.SubmitBuffer(bytes);
+            _audioSubmitted++;
+        }
+        if (_audioSubmitted > 100 && _sound.PendingBufferCount == 0) _audioStarved++;  // steady state only
+    }
+
+    protected override void OnExiting(object sender, ExitingEventArgs args)
+    {
+        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "audio_stats.txt"),
+            $"rate {_soundRate} submitted {_audioSubmitted} buffers ({_audioSubmitted * AudioChunkFrames / (double)Math.Max(1, _soundRate):F1} s), starved updates {_audioStarved}\n");
+        base.OnExiting(sender, args);
+    }
+
+    // ---- frames ----------------------------------------------------------------------
+    private unsafe void PullFrame()
+    {
+        CoreFrame* f = Core.AcquireFrame();
+        if (f == null) return;
+        try
+        {
+            if (f->Serial == _lastSerial) return;
+            _lastSerial = f->Serial;
+            _framesReceived++;
+            _clearColor = new Color(f->ClearColor);
+
+            if (_vertices.Length < f->VertexCount) _vertices = new TevVertex[f->VertexCount * 2];
+            new ReadOnlySpan<TevVertex>(f->Vertices, (int)f->VertexCount).CopyTo(_vertices);
+
+            var textures = new Texture2D?[f->TextureCount];
+            for (int i = 0; i < f->TextureCount; i++) textures[i] = GetTexture(&f->Textures[i]);
+
+            while (_materials.Count < f->MaterialCount) _materials.Add(new MaterialParams());
+            for (int i = 0; i < f->MaterialCount; i++) ConvertMaterial(&f->Materials[i], _materials[i]);
+
+            while (_batches.Count < f->BatchCount) _batches.Add(new Batch());
+            _batches.RemoveRange((int)f->BatchCount, _batches.Count - (int)f->BatchCount);
+            for (int i = 0; i < f->BatchCount; i++)
+            {
+                CoreBatch* cb = &f->Batches[i];
+                var b = _batches[i];
+                float* m = cb->Proj;
+                // Core matrices are row-major for column vectors; MonoGame uses row vectors.
+                b.Projection = new Matrix(m[0], m[4], m[8], m[12],
+                                          m[1], m[5], m[9], m[13],
+                                          m[2], m[6], m[10], m[14],
+                                          m[3], m[7], m[11], m[15]);
+                b.First = (int)cb->FirstVertex; b.Count = (int)cb->VertexCount;
+                b.Material = (int)cb->Material;
+                for (int t = 0; t < 8; t++)
+                {
+                    b.Textures[t] = cb->Textures[t] >= 0 ? textures[cb->Textures[t]] : null;
+                    b.TextureIds[t] = cb->Textures[t] >= 0 ? f->Textures[cb->Textures[t]].Id : 0;
+                    b.Samplers[t] = Sampler(cb->Sampler[t]);
+                }
+                b.Viewport = new Rectangle(cb->Viewport[0] * RenderScale, cb->Viewport[1] * RenderScale,
+                                           cb->Viewport[2] * RenderScale, cb->Viewport[3] * RenderScale);
+                b.Scissor = new Rectangle(cb->Scissor[0] * RenderScale, cb->Scissor[1] * RenderScale,
+                                          (cb->Scissor[2] - cb->Scissor[0]) * RenderScale,
+                                          (cb->Scissor[3] - cb->Scissor[1]) * RenderScale);
+            }
+        }
+        finally
+        {
+            Core.ReleaseFrame();
+        }
+        PurgeTextures();
+    }
+
+    private static unsafe void Copy(float* src, Vector4[] dst)
+    {
+        for (int i = 0; i < dst.Length; i++)
+            dst[i] = new Vector4(src[4 * i], src[4 * i + 1], src[4 * i + 2], src[4 * i + 3]);
+    }
+
+    private static unsafe void ConvertMaterial(CoreMaterial* m, MaterialParams p)
+    {
+        Copy(m->ColorIn, p.ColorIn); Copy(m->AlphaIn, p.AlphaIn);
+        Copy(m->ColorOp, p.ColorOp); Copy(m->AlphaOp, p.AlphaOp);
+        Copy(m->Stage, p.Stage); Copy(m->Swap, p.Swap); Copy(m->Konst, p.Konst);
+        Copy(m->SwapTable, p.SwapTable); Copy(m->Regs, p.Regs); Copy(m->MapCoord, p.MapCoord);
+        p.AlphaTest = new Vector4(m->AlphaTest[0], m->AlphaTest[1], m->AlphaTest[2], m->AlphaTest[3]);
+        p.Misc = new Vector4(m->Misc[0], m->Misc[1], m->Misc[2], m->Misc[3]);
+        p.Blend = BlendFor(m->Blend);
+        p.Depth = DepthFor(m->ZMode);
+    }
+
+    private unsafe Texture2D GetTexture(CoreTexture* t)
+    {
+        if (_textures.TryGetValue(t->Id, out var e))
+        {
+            _textures[t->Id] = (e.Tex, _framesReceived);
+            return e.Tex;
+        }
+        var tex = new Texture2D(GraphicsDevice, (int)t->Width, (int)t->Height, false, SurfaceFormat.Color);
+        var pixels = new uint[t->Width * t->Height];
+        new ReadOnlySpan<uint>(t->Rgba, pixels.Length).CopyTo(pixels);
+        tex.SetData(pixels);
+        _textures[t->Id] = (tex, _framesReceived);
+        return tex;
+    }
+
+    private void PurgeTextures()
+    {
+        if (_framesReceived % 120 != 0) return;
+        var stale = new List<uint>();
+        foreach (var (id, e) in _textures)
+            if (_framesReceived - e.LastUsed > 600) stale.Add(id);
+        foreach (var id in stale) { _textures[id].Tex.Dispose(); _textures.Remove(id); }
+    }
+
+    // ---- GX -> MonoGame state ------------------------------------------------------------
+    private static readonly Dictionary<uint, BlendState> BlendCache = new();
+    private static readonly Dictionary<uint, DepthStencilState> DepthCache = new();
+    private static readonly Dictionary<uint, SamplerState> SamplerCache = new();
+
+    // CMODE0: bit0 blend, bit3 colour update, bit4 alpha update, dst 5-7, src 8-10, bit11 subtract
+    private static BlendState BlendFor(uint cm)
+    {
+        uint key = cm & 0xFFF;
+        if (BlendCache.TryGetValue(key, out var s)) return s;
+        static Blend Src(uint f) => f switch
+        {
+            0 => Blend.Zero, 1 => Blend.One, 2 => Blend.DestinationColor, 3 => Blend.InverseDestinationColor,
+            4 => Blend.SourceAlpha, 5 => Blend.InverseSourceAlpha, 6 => Blend.DestinationAlpha, _ => Blend.InverseDestinationAlpha,
+        };
+        static Blend Dst(uint f) => f switch
+        {
+            0 => Blend.Zero, 1 => Blend.One, 2 => Blend.SourceColor, 3 => Blend.InverseSourceColor,
+            4 => Blend.SourceAlpha, 5 => Blend.InverseSourceAlpha, 6 => Blend.DestinationAlpha, _ => Blend.InverseDestinationAlpha,
+        };
+        var mask = ColorWriteChannels.None;
+        if ((cm & 8) != 0) mask |= ColorWriteChannels.Red | ColorWriteChannels.Green | ColorWriteChannels.Blue;
+        if ((cm & 16) != 0) mask |= ColorWriteChannels.Alpha;
+        s = new BlendState { ColorWriteChannels = mask };
+        if ((cm & 1) != 0)
+        {
+            if ((cm & 0x800) != 0)
+            {
+                s.ColorBlendFunction = s.AlphaBlendFunction = BlendFunction.ReverseSubtract;
+                s.ColorSourceBlend = s.AlphaSourceBlend = Blend.One;
+                s.ColorDestinationBlend = s.AlphaDestinationBlend = Blend.One;
+            }
+            else
+            {
+                s.ColorSourceBlend = s.AlphaSourceBlend = Src((cm >> 8) & 7);
+                s.ColorDestinationBlend = s.AlphaDestinationBlend = Dst((cm >> 5) & 7);
+            }
+        }
+        else
+        {
+            s.ColorSourceBlend = s.AlphaSourceBlend = Blend.One;
+            s.ColorDestinationBlend = s.AlphaDestinationBlend = Blend.Zero;
+        }
+        BlendCache[key] = s;
+        return s;
+    }
+
+    // ZMODE: bit0 enable, func 1-3, bit4 update
+    private static DepthStencilState DepthFor(uint z)
+    {
+        uint key = z & 0x1F;
+        if (DepthCache.TryGetValue(key, out var s)) return s;
+        bool enable = (z & 1) != 0;
+        var func = ((z >> 1) & 7) switch
+        {
+            0 => CompareFunction.Never, 1 => CompareFunction.Less, 2 => CompareFunction.Equal, 3 => CompareFunction.LessEqual,
+            4 => CompareFunction.Greater, 5 => CompareFunction.NotEqual, 6 => CompareFunction.GreaterEqual, _ => CompareFunction.Always,
+        };
+        s = new DepthStencilState
+        {
+            DepthBufferEnable = enable,
+            DepthBufferWriteEnable = enable && (z & 16) != 0,
+            DepthBufferFunction = func,
+        };
+        DepthCache[key] = s;
+        return s;
+    }
+
+    // TX_SETMODE0: wrap s 0-1, wrap t 2-3 (0 clamp, 1 repeat, 2 mirror), bit4 linear mag filter
+    private static SamplerState Sampler(uint mode)
+    {
+        uint key = mode & 0x1F;
+        if (SamplerCache.TryGetValue(key, out var s)) return s;
+        static TextureAddressMode Wrap(uint w) => w switch
+        {
+            1 => TextureAddressMode.Wrap, 2 => TextureAddressMode.Mirror, _ => TextureAddressMode.Clamp,
+        };
+        s = new SamplerState
+        {
+            AddressU = Wrap(mode & 3),
+            AddressV = Wrap((mode >> 2) & 3),
+            Filter = (mode & 16) != 0 ? TextureFilter.Linear : TextureFilter.Point,
+        };
+        SamplerCache[key] = s;
+        return s;
+    }
+
+    // ---- rendering ---------------------------------------------------------------------
+    private static readonly RasterizerState Raster = new()
+    {
+        CullMode = CullMode.None,
+        ScissorTestEnable = true,
+    };
+
+    protected override void Draw(GameTime gameTime)
+    {
+        PullFrame();
+        var gd = GraphicsDevice;
+        gd.SetRenderTarget(_target);
+        gd.Clear(ClearOptions.Target | ClearOptions.DepthBuffer, _clearColor, 1f, 0);
+        gd.RasterizerState = Raster;
+
+        var fx = _tev!;
+        var P = fx.Parameters;
+        foreach (var b in _batches)
+        {
+            if (b.Count == 0 || b.Viewport.Width <= 0 || b.Viewport.Height <= 0) continue;
+            var m = _materials[b.Material];
+            gd.Viewport = new Viewport(b.Viewport.X, b.Viewport.Y, b.Viewport.Width, b.Viewport.Height, 0f, 1f);
+            gd.ScissorRectangle = Rectangle.Intersect(b.Scissor, _target!.Bounds);
+            gd.DepthStencilState = m.Depth;
+            gd.BlendState = m.Blend;
+
+            P["Proj"].SetValue(b.Projection);
+            P["ColorIn"].SetValue(m.ColorIn); P["AlphaIn"].SetValue(m.AlphaIn);
+            P["ColorOp"].SetValue(m.ColorOp); P["AlphaOp"].SetValue(m.AlphaOp);
+            P["Stage"].SetValue(m.Stage); P["Swap"].SetValue(m.Swap); P["Konst"].SetValue(m.Konst);
+            P["SwapTable"].SetValue(m.SwapTable); P["Regs"].SetValue(m.Regs); P["MapCoord"].SetValue(m.MapCoord);
+            P["AlphaTest"].SetValue(m.AlphaTest);
+            P["Misc"].SetValue(new Vector4(m.Misc.X, m.Misc.Y, _debugView, 0));
+            for (int t = 0; t < 8; t++) P["Tex" + t].SetValue(b.Textures[t] ?? _white);
+
+            fx.CurrentTechnique.Passes[0].Apply();
+            for (int t = 0; t < 8; t++) gd.SamplerStates[t] = b.Samplers[t];
+            gd.DrawUserPrimitives(PrimitiveType.TriangleList, _vertices, b.First, b.Count / 3, TevVertex.Declaration);
+        }
+
+        gd.SetRenderTarget(null);
+        gd.Viewport = new Viewport(0, 0, gd.PresentationParameters.BackBufferWidth, gd.PresentationParameters.BackBufferHeight);
+        gd.Clear(Color.Black);
+        // Letterbox the 4:3 EFB into the window.
+        var bb = gd.Viewport.Bounds;
+        float scale = Math.Min(bb.Width / (float)_target!.Width, bb.Height / (float)_target.Height);
+        int w = (int)(_target.Width * scale), h = (int)(_target.Height * scale);
+        _sprites!.Begin(samplerState: SamplerState.LinearClamp);
+        _sprites.Draw(_target, new Rectangle((bb.Width - w) / 2, (bb.Height - h) / 2, w, h), Color.White);
+        _sprites.End();
+
+        if (Environment.GetEnvironmentVariable("TUROK_GXDUMP") == _framesReceived.ToString()) Core.RequestGxDump();
+        if (Environment.GetEnvironmentVariable("TUROK_DUMP_TEXTURES") == _framesReceived.ToString())
+        {
+            var dir = Path.Combine(AppContext.BaseDirectory, $"textures_{_framesReceived:D5}");
+            Directory.CreateDirectory(dir);
+            foreach (var (id, e) in _textures)
+                if (e.LastUsed == _framesReceived)
+                    using (var fs = File.Create(Path.Combine(dir, $"tex_{id:D5}.png"))) e.Tex.SaveAsPng(fs, e.Tex.Width, e.Tex.Height);
+            using var bw = new StreamWriter(Path.Combine(dir, "batches.txt"));
+            foreach (var b in _batches)
+            {
+                var m = _materials[b.Material];
+                var v = _vertices[b.First];
+                bw.WriteLine($"verts {b.Count} stages {m.Misc.Y} maps [{string.Join(",", b.TextureIds)}] stage0 map {m.Stage[0].X} coord {m.MapCoord[0]} " +
+                            $"stage1 map {m.Stage[1].X} uv0 ({v.T0.X:F2},{v.T0.Y:F2}) uv1 ({v.T1.X:F2},{v.T1.Y:F2}) c0 {v.Color0} c1 {v.Color1}");
+            }
+        }
+        bool scheduled = _screenshotFrames.Remove(_framesReceived);
+        if (_screenshotPending || scheduled)
+        {
+            _screenshotPending = false;
+            var path = Path.Combine(AppContext.BaseDirectory, $"screenshot_{_framesReceived:D5}.png");
+            using (var fs = File.Create(path)) _target.SaveAsPng(fs, _target.Width, _target.Height);
+            if (scheduled && _screenshotFrames.Count == 0 && Environment.GetEnvironmentVariable("TUROK_EXIT_AFTER_SCREENSHOT") == "1")
+                Exit();
+        }
+        base.Draw(gameTime);
+    }
+}

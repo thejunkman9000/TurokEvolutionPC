@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RollForward>Major</RollForward>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>TurokEvolution</AssemblyName>
+    <RootNamespace>TurokHost</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MonoGame.Framework.WindowsDX" Version="3.8.6" />
+  </ItemGroup>
+
+  <!-- TEV shader: compiled with mgfxc (tools/bin/dotnet) and embedded. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Shaders/Tev.mgfxo" LogicalName="Tev.mgfxo" />
+  </ItemGroup>
+  <Target Name="CompileShaders" BeforeTargets="BeforeBuild" Inputs="Shaders/Tev.fx" Outputs="Shaders/Tev.mgfxo">
+    <Exec Command="&quot;$(MSBuildProjectDirectory)/../../tools/bin/dotnet/mgfxc.exe&quot; Shaders/Tev.fx Shaders/Tev.mgfxo /Profile:DirectX_11" />
+  </Target>
+
+  <!-- The recompiled game (built by CMake into recomp/build). -->
+  <ItemGroup>
+    <None Include="../../recomp/build/turok_core.dll" Link="turok_core.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../recomp/build/turok_core.pdb" Link="turok_core.pdb" CopyToOutputDirectory="PreserveNewest" Condition="Exists('../../recomp/build/turok_core.pdb')" />
+  </ItemGroup>
+
+</Project>

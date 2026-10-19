@@ -1,0 +1,37 @@
+# --- Game data: user-supplied and copyrighted, never committed -----------------
+*.iso
+*.gcm
+*.rvz
+extracted/
+decomp/orig/
+# Everything derived directly from the game binary (regenerable from the ISO):
+recomp/generated/
+analysis/main.asm
+analysis/strings.txt
+analysis/*.png
+analysis/*.wav
+
+# --- Saves, logs, captures --------------------------------------------------------
+saves/
+*.log
+turok_audio.wav
+screenshot_*.png
+textures_*/
+title_view*.png
+vat*.png
+audio_stats.txt
+
+# --- Build outputs ----------------------------------------------------------------
+recomp/build/
+recomp/build_log.txt
+decomp/build/
+host/**/bin/
+host/**/obj/
+host/TurokHost/Shaders/*.mgfxo
+tools/bin/
+__pycache__/
+.vs/
+
+# --- Third-party reference sources (re-fetch with curl, see analysis/NOTES.md) ---
+reference/dolphin/
+reference/dolsdk/
