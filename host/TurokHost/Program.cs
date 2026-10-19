@@ -13,6 +13,7 @@ internal static class Program
         // TurokEvolution.exe [disc.iso] [--fullscreen] [--scale N] [--no-vsync] [--widescreen]
         //                    [--level data/levels/<pod>/<name>/<name>.atr]  (New Game starts that level)
         //                    [--mouse-sens X]  (mouse look speed multiplier, default 1)
+        //                    [--invert-look]   (keep the game's inverted look on the pad's right stick)
         string? iso = null;
         var opt = new TurokGame.Options();
         for (int i = 0; i < args.Length; i++)
@@ -22,6 +23,7 @@ internal static class Program
             case "--fullscreen": opt = opt with { Fullscreen = true }; break;
             case "--no-vsync": opt = opt with { VSync = false }; break;
             case "--widescreen": opt = opt with { Widescreen = true }; break;
+            case "--invert-look": opt = opt with { InvertLook = true }; break;
             case "--level" when i + 1 < args.Length: Environment.SetEnvironmentVariable("TUROK_LEVEL", args[++i]); break;
             case "--mouse-sens" when i + 1 < args.Length && float.TryParse(args[i + 1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ms):
                 opt = opt with { MouseSensitivity = ms }; i++; break;

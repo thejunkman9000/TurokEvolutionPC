@@ -124,6 +124,11 @@ internal static unsafe partial class Core
     [LibraryImport(Dll, EntryPoint = "core_mouse_look")]
     public static partial void MouseLook(float dyaw, float dpitch);
 
+    // True while mouse look applies (on-foot first-person control).
+    [LibraryImport(Dll, EntryPoint = "core_first_person")]
+    private static partial int FirstPersonRaw();
+    public static bool FirstPerson() => FirstPersonRaw() != 0;
+
     [LibraryImport(Dll, EntryPoint = "core_ram")]
     public static partial byte* Ram(out uint size);
 

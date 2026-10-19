@@ -85,7 +85,9 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
     - `turok_run.exe` writes `turok_audio.wav`; `tools/spectrogram.py` renders it.
   - Screenshots: F12, or `TUROK_SCREENSHOT=<frame>` (plus `TUROK_EXIT_AFTER_SCREENSHOT=1`).
   - Input: keyboard and XInput are mapped to GameCube pad bits in `core_set_pad`; the core's `PADRead` HLE (`hle_pad.c`) feeds them to the game.
-    - Keys: WASD = stick, IJKL = C-stick, Enter = Start, Space = A, Shift = B, E = X, Q = Y, Tab = Z, Z / left mouse = L / R, arrows = D-pad.
+    - Modern FPS bindings (README "Controls") over the game's default FPS layout: stick move/strafe, C-stick turn/look, R fire, L duck, Z zoom, A jump, B next weapon, Y previous weapon, X weapon mode, D-pad unused.
+    - `core_first_person()` (true while the player's view actor drives the camera, including the pause menu and flight) switches the host between the modern layout and plain pass-through for menus.
+    - The game's Invert Look defaults to on, so the host flips the pad's right-stick Y unless `--invert-look` is passed. Mouse look writes angles directly and is unaffected.
   - Debug environment variables:
     - `TUROK_INPUT=frame:Button[:hold],...`: scripted input.
     - `TUROK_SCREENSHOT=f1,f2,...`: capture those frames.

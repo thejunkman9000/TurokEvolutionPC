@@ -36,6 +36,7 @@
 
 static SRWLOCK s_lock = SRWLOCK_INIT;
 static float s_dyaw, s_dpitch;
+static volatile LONG s_first_person;  // last poll: the player's view drove the camera
 
 CORE_API void core_mouse_look(float dyaw, float dpitch) {
     AcquireSRWLockExclusive(&s_lock);
@@ -43,6 +44,9 @@ CORE_API void core_mouse_look(float dyaw, float dpitch) {
     s_dpitch += dpitch;
     ReleaseSRWLockExclusive(&s_lock);
 }
+
+// 1 while mouse look applies (first-person control), 0 in flight, cutscenes and menus.
+CORE_API int core_first_person(void) { return (int)s_first_person; }
 
 static float wrap_pi(float a) {
     a = fmodf(a + PI, TWO_PI);
@@ -100,6 +104,9 @@ static void apply_mouse_look(void) {
     s_dyaw = s_dpitch = 0;
     ReleaseSRWLockExclusive(&s_lock);
     uint32_t v = player_view();
+    static unsigned polls;
+    polls++;
+    if (InterlockedExchange(&s_first_person, v != 0) != (v != 0)) logf_("[look] first-person %s (poll %u)", v ? "on" : "off", polls);
     if (v && dyaw != 0) {
         float yaw = fmodf(u2f(rd32(v + VIEW_YAW)) + dyaw, TWO_PI);
         if (yaw < 0) yaw += TWO_PI;

@@ -130,3 +130,7 @@ CORE_API void core_set_pad(int port, uint16_t buttons, int8_t stick_x, int8_t st
 // yaw turns left, positive pitch looks up). Accumulated and applied once per game
 // frame; ignored when the player's view isn't the active camera.
 CORE_API void core_mouse_look(float dyaw, float dpitch);
+
+// 1 while core_mouse_look applies (on-foot first-person control); 0 in flight
+// sections, cutscenes and menus, where the host falls back to C-stick emulation.
+CORE_API int core_first_person(void);

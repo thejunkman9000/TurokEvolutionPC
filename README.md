@@ -38,21 +38,32 @@ Level select: `--level data/levels/<pod>/<name>/<name>.atr` makes **New Game** s
 first jungle level, e.g. `--level data/levels/pod-07-dark-jungle/darkjungle_1/darkjungle_1.atr`.
 `analysis/level_paths.txt` lists the level paths found in the game's archive.
 
-Mouse look: click in the window to capture the mouse (Esc releases it). The mouse turns the view directly, like a PC
-shooter, instead of emulating the C-stick. `--mouse-sens 1.5` makes it faster.
+### Controls
+
+Modern PC / console FPS controls, mapped onto the game's default "FPS" layout (Options > Control Setup).
+Click in the window to capture the mouse; the mouse turns the view directly, like a PC shooter
+(`--mouse-sens 1.5` makes it faster).
 
 | Action | Keyboard / mouse | Xbox controller |
 |---|---|---|
-| Move | W A S D | left stick |
-| Look | mouse (click to capture, Esc to release), or I J K L | right stick |
-| Fire (R) | left mouse button | right trigger |
-| L | right mouse button / Z | left trigger |
-| A / B / X / Y | Space / Shift / E / Q | A / B / X / Y |
-| Z | Tab | right shoulder |
-| Start | Enter | Start |
-| D-pad | arrow keys | D-pad |
+| Move / strafe | W A S D (hold Shift to walk) | left stick |
+| Look | mouse | right stick (up looks up) |
+| Fire | left mouse button | right trigger |
+| Zoom | right mouse button | left trigger |
+| Jump | Space | A |
+| Duck | Ctrl or C (hold) | B or left-stick click |
+| Next / previous weapon | mouse wheel down / up, E / Q | RB / LB (Y = next) |
+| Weapon mode (alternate ammo) | F, R or middle mouse button | X |
+| Pause / resume | Esc (also frees / recaptures the mouse) | Start |
+| Menus: select / back | Space / Esc or Backspace (Enter = Start) | A / B |
+| Menu navigation | arrow keys or W A S D | D-pad or left stick |
 | Fullscreen | F11 or Alt+Enter | |
 | Screenshot | F12 | |
+
+The modern layout applies while you control the player; in menus and cutscenes the buttons pass
+straight through (A/B/X/Y = A/B/X/Y). The game ships with *Invert Look* on, so the controller's right
+stick is flipped to make up look up; `--invert-look` keeps the game's inverted behaviour (or turn
+*Invert Look* off in Options > Control Setup > Advanced Options and pass `--invert-look`).
 
 Saves are written to `saves\GTKE51\Card A\` next to the executable, as `.gci` files that Dolphin can import.
 

@@ -55,6 +55,10 @@ internal sealed class TurokGame : Game
     private bool _fullscreenKeyHeld;
     // Mouse look: click in the window to capture the mouse, Esc to release.
     private bool _mouseCaptured;
+    private bool _escHeld;
+    private int _prevWheel;
+    private readonly bool _invertLook;
+    private readonly List<(PadButtons button, int age)> _pulses = new();
     private bool _wasActive, _prevLeftDown, _swallowClick;
     private const float MouseRadiansPerPixel = 0.0022f;  // at --mouse-sens 1
     private readonly float _mouseRadPerPixel;
@@ -98,12 +102,13 @@ internal sealed class TurokGame : Game
     }
 
     public sealed record Options(int Scale = 2, bool Fullscreen = false, bool VSync = true, bool Widescreen = false,
-                                 float MouseSensitivity = 1f);
+                                 float MouseSensitivity = 1f, bool InvertLook = false);
 
     public TurokGame(string isoPath, Options? options = null)
     {
         options ??= new Options();
         _mouseRadPerPixel = MouseRadiansPerPixel * options.MouseSensitivity;
+        _invertLook = options.InvertLook;
         _isoPath = isoPath;
         RenderScale = Math.Clamp(options.Scale, 1, 4);
         EfbWidth = options.Widescreen ? 854 : 640;
@@ -182,6 +187,13 @@ internal sealed class TurokGame : Game
         _white.SetData(new[] { Color.White });
     }
 
+    private void SetMouseCapture(bool on)
+    {
+        _mouseCaptured = on;
+        IsMouseVisible = !on;
+        if (on) Mouse.SetPosition(Window.ClientBounds.Width / 2, Window.ClientBounds.Height / 2);
+    }
+
     // ---- input ---------------------------------------------------------------------
     protected override void Update(GameTime gameTime)
     {
@@ -194,23 +206,55 @@ internal sealed class TurokGame : Game
         _fullscreenKeyHeld = toggle;
         bool altHeld = kb.IsKeyDown(Keys.LeftAlt) || kb.IsKeyDown(Keys.RightAlt);
 
+        // Modern PC/console FPS controls mapped onto the game's default "FPS" layout
+        // (Options > Control Setup): stick move/strafe, C-stick turn/look, R fire,
+        // L duck, Z zoom, A jump, B next weapon, Y previous weapon, X weapon mode.
+        // In first-person play the modern layout applies; in menus, cutscenes and
+        // flight the buttons map straight through so the game's prompts stay right.
+        bool firstPerson = Core.FirstPerson();
+        var mouse = Mouse.GetState();
         PadButtons b = 0;
         void Map(bool down, PadButtons button) { if (down) b |= button; }
-        Map((kb.IsKeyDown(Keys.Enter) && !altHeld) || gp.Buttons.Start == ButtonState.Pressed, PadButtons.Start);
-        Map(kb.IsKeyDown(Keys.Space) || gp.Buttons.A == ButtonState.Pressed, PadButtons.A);
-        Map(kb.IsKeyDown(Keys.LeftShift) || gp.Buttons.B == ButtonState.Pressed, PadButtons.B);
-        Map(kb.IsKeyDown(Keys.E) || gp.Buttons.X == ButtonState.Pressed, PadButtons.X);
-        Map(kb.IsKeyDown(Keys.Q) || gp.Buttons.Y == ButtonState.Pressed, PadButtons.Y);
-        Map(kb.IsKeyDown(Keys.Tab) || gp.Buttons.RightShoulder == ButtonState.Pressed, PadButtons.Z);
-        Map(kb.IsKeyDown(Keys.Up) || gp.DPad.Up == ButtonState.Pressed, PadButtons.Up);
-        Map(kb.IsKeyDown(Keys.Down) || gp.DPad.Down == ButtonState.Pressed, PadButtons.Down);
-        Map(kb.IsKeyDown(Keys.Left) || gp.DPad.Left == ButtonState.Pressed, PadButtons.Left);
-        Map(kb.IsKeyDown(Keys.Right) || gp.DPad.Right == ButtonState.Pressed, PadButtons.Right);
+        bool Key(Keys k) => kb.IsKeyDown(k);
+        bool Pad(Buttons btn) => gp.IsButtonDown(btn);
 
+        // Esc: pause/resume in play (and release/recapture the mouse), back in menus.
+        bool esc = Key(Keys.Escape);
+        bool escPressed = esc && !_escHeld && IsActive;
+        _escHeld = esc;
+        if (escPressed && firstPerson) { _pulses.Add((PadButtons.Start, 0)); SetMouseCapture(!_mouseCaptured); }
+        Map(esc && !firstPerson, PadButtons.B);
+
+        Map((Key(Keys.Enter) && !altHeld) || Pad(Buttons.Start), PadButtons.Start);
+        Map(Key(Keys.Up) || Pad(Buttons.DPadUp), PadButtons.Up);
+        Map(Key(Keys.Down) || Pad(Buttons.DPadDown), PadButtons.Down);
+        Map(Key(Keys.Left) || Pad(Buttons.DPadLeft), PadButtons.Left);
+        Map(Key(Keys.Right) || Pad(Buttons.DPadRight), PadButtons.Right);
+        Map(Key(Keys.Space) || Pad(Buttons.A), PadButtons.A);  // jump / select
+        if (firstPerson)
+        {
+            // Keyboard: Ctrl/C duck, Q/E previous/next weapon, F or R weapon mode.
+            // Pad: B or left-stick click duck, LB/RB previous/next weapon, Y next weapon, X weapon mode.
+            bool duck = Key(Keys.LeftControl) || Key(Keys.C) || Pad(Buttons.B) || Pad(Buttons.LeftStick);
+            if (duck) b |= PadButtons.L;
+            Map(Key(Keys.E) || Pad(Buttons.RightShoulder) || Pad(Buttons.Y), PadButtons.B);
+            Map(Key(Keys.Q) || Pad(Buttons.LeftShoulder), PadButtons.Y);
+            Map(Key(Keys.F) || Key(Keys.R) || Pad(Buttons.X) || (_mouseCaptured && mouse.MiddleButton == ButtonState.Pressed), PadButtons.X);
+        }
+        else
+        {
+            Map(Key(Keys.Back) || Pad(Buttons.B), PadButtons.B);
+            Map(Pad(Buttons.X), PadButtons.X);
+            Map(Pad(Buttons.Y), PadButtons.Y);
+            Map(Pad(Buttons.RightShoulder), PadButtons.Z);
+        }
+
+        // Movement: WASD / left stick; hold Shift to walk.
         float lx = gp.ThumbSticks.Left.X, ly = gp.ThumbSticks.Left.Y;
-        if (kb.IsKeyDown(Keys.A)) lx = -1; if (kb.IsKeyDown(Keys.D)) lx = 1;
-        if (kb.IsKeyDown(Keys.W)) ly = 1;  if (kb.IsKeyDown(Keys.S)) ly = -1;
-        var mouse = Mouse.GetState();
+        if (Key(Keys.A)) lx = -1; if (Key(Keys.D)) lx = 1;
+        if (Key(Keys.W)) ly = 1;  if (Key(Keys.S)) ly = -1;
+        if (Key(Keys.LeftShift) || Key(Keys.RightShift)) { lx *= 0.5f; ly *= 0.5f; }
+
         var center = new Point(Window.ClientBounds.Width / 2, Window.ClientBounds.Height / 2);
         // Capture only on a fresh click inside the window while it already had focus, so the
         // click that brings the window to the front (or lands on another window) is ignored.
@@ -222,38 +266,61 @@ internal sealed class TurokGame : Game
         if (!_mouseCaptured && IsActive && focusedBefore && clicked &&
             new Rectangle(0, 0, Window.ClientBounds.Width, Window.ClientBounds.Height).Contains(mouse.X, mouse.Y))
         {
-            _mouseCaptured = true;
+            SetMouseCapture(true);
             _swallowClick = true;  // the capturing click doesn't also fire
-            IsMouseVisible = false;
-            Mouse.SetPosition(center.X, center.Y);
             mouse = Mouse.GetState();
         }
         if (_swallowClick && !leftDown) _swallowClick = false;
-        if (_mouseCaptured && (kb.IsKeyDown(Keys.Escape) || !IsActive))
-        {
-            _mouseCaptured = false;
-            IsMouseVisible = true;
-        }
-        float mdx = 0, mdy = 0;
+        if (_mouseCaptured && !IsActive) SetMouseCapture(false);
+
+        // Mouse look. On foot it turns the view directly (core_mouse_look) like a PC
+        // shooter; elsewhere (flight) the motion is fed to the C-stick instead.
+        float cx = gp.ThumbSticks.Right.X, cy = gp.ThumbSticks.Right.Y;
+        // The game's "Invert Look" defaults to on (stick up looks down); flip the pad's
+        // right stick so up looks up, unless --invert-look keeps the game's behaviour.
+        if (!_invertLook) cy = -cy;
         if (_mouseCaptured)
         {
-            // Raw mouse motion turns the view directly (core_mouse_look), like a PC shooter:
-            // right turns right (negative yaw), up looks up (positive pitch).
-            float k = _mouseRadPerPixel;
-            mdx = (mouse.X - center.X) * k;
-            mdy = (mouse.Y - center.Y) * k;
-            if (mdx != 0 || mdy != 0) Core.MouseLook(-mdx, -mdy);
+            float dx = mouse.X - center.X, dy = mouse.Y - center.Y;
             Mouse.SetPosition(center.X, center.Y);
+            if (firstPerson)
+            {
+                if (dx != 0 || dy != 0) Core.MouseLook(-dx * _mouseRadPerPixel, -dy * _mouseRadPerPixel);
+            }
+            else
+            {
+                float sx = dx * 0.06f, sy = dy * 0.06f * (_invertLook ? -1 : 1);
+                if (Math.Abs(sx) > Math.Abs(cx)) cx = Math.Clamp(sx, -1f, 1f);
+                if (Math.Abs(sy) > Math.Abs(cy)) cy = Math.Clamp(sy, -1f, 1f);
+            }
+            // Wheel: previous/next weapon, one press per notch.
+            int wheel = mouse.ScrollWheelValue;
+            int notches = (wheel - _prevWheel) / 120;
+            _prevWheel = wheel;
+            if (firstPerson)
+                for (int i = 0; i < Math.Min(Math.Abs(notches), 4); i++)
+                    _pulses.Add((notches > 0 ? PadButtons.Y : PadButtons.B, 0));
         }
+        else _prevWheel = mouse.ScrollWheelValue;
+
+        // Fire / zoom: left / right mouse, right / left trigger.
         bool mouseFire = _mouseCaptured && !_swallowClick && mouse.LeftButton == ButtonState.Pressed;
-        bool mouseAlt = _mouseCaptured && mouse.RightButton == ButtonState.Pressed;
-        float lt = Math.Max(gp.Triggers.Left, kb.IsKeyDown(Keys.Z) || mouseAlt ? 1f : 0f);
+        bool mouseZoom = _mouseCaptured && mouse.RightButton == ButtonState.Pressed;
         float rt = Math.Max(gp.Triggers.Right, mouseFire ? 1f : 0f);
+        if (rt > 0.5f) b |= PadButtons.R;
+        float lt = 0;
+        if (firstPerson) { if (mouseZoom || gp.Triggers.Left > 0.5f) b |= PadButtons.Z; }
+        else lt = gp.Triggers.Left;
+        if ((b & PadButtons.L) != 0) lt = 1;
         if (lt > 0.9f) b |= PadButtons.L;
-        if (rt > 0.9f) b |= PadButtons.R;
-        float cx = gp.ThumbSticks.Right.X, cy = gp.ThumbSticks.Right.Y;
-        if (kb.IsKeyDown(Keys.J)) cx = -1; if (kb.IsKeyDown(Keys.L)) cx = 1;
-        if (kb.IsKeyDown(Keys.I)) cy = 1;  if (kb.IsKeyDown(Keys.K)) cy = -1;
+
+        // Button pulses (weapon wheel, Esc pause): 4 frames down, 4 up, one after another.
+        if (_pulses.Count > 0)
+        {
+            var (button, age) = _pulses[0];
+            if (age < 4) b |= button;
+            if (age >= 7) _pulses.RemoveAt(0); else _pulses[0] = (button, age + 1);
+        }
         foreach (var (frame, button, hold) in _script)
             if (_framesReceived >= frame && _framesReceived < frame + hold) b |= button;
         foreach (var (frame, axis, hold) in _stickScript)
