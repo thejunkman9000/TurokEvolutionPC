@@ -11,9 +11,13 @@
 //   CPU -> DSP: 0xCDD1000x task mail (RESUME / NEW_UCODE / RESET / CONTINUE)
 //
 // Samples are read from ARAM through a simulated "accelerator" (ADPCM, PCM8,
-// PCM16 with hardware looping) and resampled linearly (the polyphase filter
-// needs coefficients from the DSP ROM, which we don't ship).
+// PCM16 with hardware looping) and resampled by the voice's SRC type: 4-tap
+// polyphase, linear or none. The polyphase coefficients live in the DSP ROM,
+// which we don't ship; equivalent tables are generated at startup (see
+// init_coefs).
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "ppc.h"
 #include "host.h"
 #include "hw.h"
@@ -48,7 +52,8 @@ enum {
     PB_NEXT_HI = 0, PB_NEXT_LO = 1, PB_SRC_TYPE = 4, PB_COEF_SELECT = 5, PB_MIXER_CONTROL = 6,
     PB_RUNNING = 7, PB_IS_STREAM = 8,
     PB_MIXER = 9,          // 9 x {volume, delta}: mainL, mainR, auxAL, auxAR, auxBL, auxBR, auxBS, mainS, auxAS
-    PB_ITD_ON = 27,
+    PB_ITD_ON = 27, PB_ITD_BUF_HI = 28, PB_ITD_BUF_LO = 29,  // ITD: on, main-RAM history buffer (32 x s16),
+    PB_ITD_SHIFT_L = 30, PB_ITD_SHIFT_R = 31, PB_ITD_TARGET_L = 32, PB_ITD_TARGET_R = 33,  // current / target delay
     PB_UPD_NUM = 34, PB_UPD_HI = 39, PB_UPD_LO = 40,
     PB_DPOP = 41,          // mainL auxAL auxBL mainR auxAR auxBR mainS auxAS auxBS
     PB_VOL = 50, PB_VOL_DELTA = 51,
@@ -78,6 +83,9 @@ static void mixer_flags(uint16_t mc, int on[NBUS], int ramp[NBUS]) {
     if (mc & 0x0800) ramp[AUXB_L] = ramp[AUXB_R] = 1;
     on[AUXB_S] = (mc & 0x1000) != 0; ramp[AUXB_S] = (mc & 0x2000) != 0;
 }
+
+enum { SRC_POLYPHASE = 0, SRC_LINEAR = 1, SRC_NONE = 2 };
+static int s_linear_only;  // TUROK_AX_LINEAR=1: old behaviour (linear for polyphase voices), for A/B comparison
 
 // ---- accelerator --------------------------------------------------------------------
 typedef struct {
@@ -159,6 +167,51 @@ static int16_t acc_sample(Acc *a) {
     return val;
 }
 
+// ---- polyphase coefficients -------------------------------------------------------------
+// The DSP ROM holds four 4-tap tables of 128 phases (coef_select picks one: the SDK's
+// AX_SRC_TYPE_4TAP_8K / 12K / 16K; the fourth is unused by AX and left silent).
+// We rebuild them the way Dolphin's free DSP ROM does (docs/DSP/free_dsp_rom/
+// generate_coefs.py): windowed sinc low-pass filters at 0.5 / 0.75 / 1.0 of
+// Nyquist, sampled at 512 points over 4 input samples, normalised so the
+// largest phase sums to 1.0 (0x7FFF).
+static int16_t s_coefs[4][128 * 4];
+
+static double bessel_i0(double x) {
+    double sum = 1, term = 1;
+    for (int k = 1; k < 50; k++) { term *= (x / (2 * k)) * (x / (2 * k)); sum += term; }
+    return sum;
+}
+
+static void init_coefs(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    const double PI = 3.14159265358979323846;
+    const double cutoff[3] = {0.5, 0.75, 1.0};
+    for (int t = 0; t < 3; t++) {
+        double c[512], m = 0;
+        for (int n = 0; n < 512; n++) {
+            double x = -2.0 + 4.0 * n / 511, a = x * cutoff[t] * PI;
+            double sinc = a == 0 ? 1 : sin(a) / a, w;
+            if (t == 1) {  // Kaiser, beta = 9/4 pi
+                double r = 2.0 * n / 511 - 1, beta = PI * 9 / 4;
+                w = bessel_i0(beta * sqrt(1 - r * r)) / bessel_i0(beta);
+            } else {       // Hamming
+                w = 0.54 - 0.46 * cos(2 * PI * n / 511);
+            }
+            c[n] = sinc * w;
+        }
+        // phase p, tap k = c[k * 128 + 127 - p]: tap 0 multiplies the oldest of the 4 samples
+        for (int p = 0; p < 128; p++) {
+            double sum = 0;
+            for (int k = 0; k < 4; k++) sum += c[k * 128 + 127 - p];
+            if (sum > m) m = sum;
+        }
+        for (int p = 0; p < 128; p++)
+            for (int k = 0; k < 4; k++) s_coefs[t][p * 4 + k] = (int16_t)lround(c[k * 128 + 127 - p] / m * 32767);
+    }
+}
+
 // ---- one voice, one millisecond -----------------------------------------------------------
 static void process_voice_ms(uint16_t *pb, int offset) {
     if (pb[PB_RUNNING] != 1) return;
@@ -174,20 +227,29 @@ static void process_voice_ms(uint16_t *pb, int offset) {
     a.stopped = 0;
     a.pb = pb;
 
-    // linear sample-rate conversion (polyphase falls back to linear, as without DSP ROM coefficients)
+    // sample-rate conversion (Dolphin's ResampleAudio): 4 history samples kept in the PB
     int16_t out[SAMPLES_PER_MS];
     int16_t *last = (int16_t *)&pb[PB_LAST];
     uint32_t ratio = (uint32_t)pb[PB_RATIO_HI] << 16 | pb[PB_RATIO_LO];
     uint32_t pos = pb[PB_FRAC];
-    if (pb[PB_SRC_TYPE] == 2) {  // nearest: no conversion
+    if (pb[PB_SRC_TYPE] == SRC_NONE) {
         for (int i = 0; i < SAMPLES_PER_MS; i++) out[i] = acc_sample(&a);
         memcpy(last, out + SAMPLES_PER_MS - 4, 8);
     } else {
         int16_t t[4] = {last[0], last[1], last[2], last[3]};
-        uint32_t idx = 4;
+        uint32_t idx = 4;  // t[idx & 3] is the oldest sample
+        const int16_t *coefs = s_coefs[pb[PB_COEF_SELECT] & 3];
+        int poly = pb[PB_SRC_TYPE] == SRC_POLYPHASE && !s_linear_only;
         for (int i = 0; i < SAMPLES_PER_MS; i++) {
             pos += ratio;
             while (pos >= 0x10000) { t[idx++ & 3] = acc_sample(&a); pos -= 0x10000; }
+            if (poly) {
+                const int16_t *c = &coefs[(pos & 0xFFFF) >> 9 << 2];
+                int64_t v = (int64_t)t[idx & 3] * c[0] + (int64_t)t[(idx + 1) & 3] * c[1] +
+                            (int64_t)t[(idx + 2) & 3] * c[2] + (int64_t)t[(idx + 3) & 3] * c[3];
+                out[i] = clamp16(v >> 15);
+                continue;
+            }
             uint16_t frac = (uint16_t)pos, inv = (uint16_t)-frac;
             if (frac) {
                 int32_t s0 = t[idx & 3], s1 = t[(idx + 1) & 3];
@@ -216,6 +278,28 @@ static void process_voice_ms(uint16_t *pb, int offset) {
         for (int i = 0; i < SAMPLES_PER_MS; i++) yn1 = out[i] = clamp16((a0 * out[i] + b0 * yn1) >> 15);
         pb[PB_LPF_YN1] = (uint16_t)yn1;
     }
+    // initial time delay: the left and right buses get the voice delayed by up to 31 samples
+    // (~1 ms) each, a phase difference that places the sound to one side. The previous
+    // millisecond's output is kept in the voice's main-RAM buffer; the shifts move one sample
+    // per millisecond towards their targets so changes don't click.
+    int16_t itd_l[SAMPLES_PER_MS], itd_r[SAMPLES_PER_MS];
+    const int16_t *side[2] = {out, out};
+    if (pb[PB_ITD_ON]) {
+        uint32_t buf = (uint32_t)pb[PB_ITD_BUF_HI] << 16 | pb[PB_ITD_BUF_LO];
+        int16_t hist[SAMPLES_PER_MS] = {0};
+        if (buf) for (int i = 0; i < SAMPLES_PER_MS; i++) hist[i] = (int16_t)ram16(buf + 2 * i);
+        for (int ch = 0; ch < 2; ch++) {
+            uint16_t *sh = &pb[PB_ITD_SHIFT_L + ch], target = pb[PB_ITD_TARGET_L + ch] & 31;
+            if (*sh < target) (*sh)++; else if (*sh > target) (*sh)--;
+            int d = *sh & 31;
+            int16_t *dst = ch ? itd_r : itd_l;
+            for (int i = 0; i < SAMPLES_PER_MS; i++) dst[i] = i < d ? hist[SAMPLES_PER_MS - d + i] : out[i - d];
+            side[ch] = dst;
+        }
+        if (buf) for (int i = 0; i < SAMPLES_PER_MS; i++) put_ram16(buf + 2 * i, (uint16_t)out[i]);
+    }
+    static const int BUS_SIDE[NBUS] = {0, 1, -1, 0, 1, -1, 0, 1, -1};  // L / R / surround (undelayed)
+
     // mix
     int on[NBUS], ramp[NBUS];
     mixer_flags(pb[PB_MIXER_CONTROL], on, ramp);
@@ -224,8 +308,9 @@ static void process_voice_ms(uint16_t *pb, int offset) {
         if (!on[bus]) continue;
         uint16_t vol = pb[PB_MIXER + 2 * m], delta = ramp[bus] ? pb[PB_MIXER + 2 * m + 1] : 0;
         int16_t s16 = 0;
+        const int16_t *src = BUS_SIDE[bus] < 0 ? out : side[BUS_SIDE[bus]];
         for (int i = 0; i < SAMPLES_PER_MS; i++) {
-            s16 = clamp16(((int64_t)out[i] * vol) >> 15);
+            s16 = clamp16(((int64_t)src[i] * vol) >> 15);
             s_bus[bus][offset + i] += s16;
             vol = (uint16_t)(vol + delta);
         }
@@ -234,10 +319,46 @@ static void process_voice_ms(uint16_t *pb, int offset) {
     }
 }
 
+// TUROK_AX_STATS=1: log, every ~10 s, how running voices use the SRC types, ITD, LPF and aux buses.
+static int s_stats = -1;
+static unsigned s_st_cmd[0x20], s_st_pbs;  // command histogram, parameter blocks seen
+static unsigned s_st_auxcmd, s_st_auxret;  // aux mix commands / returned (effect) buffers that were non-silent
+static unsigned s_st_frames, s_st_voices, s_st_src[4], s_st_coef[4], s_st_itd, s_st_lpf, s_st_auxa, s_st_auxb, s_st_fmt[3];
+static void stats_voice(const uint16_t *pb) {
+    s_st_pbs++;
+    if (pb[PB_RUNNING] != 1) return;
+    s_st_voices++;
+    s_st_src[pb[PB_SRC_TYPE] & 3]++; s_st_coef[pb[PB_COEF_SELECT] & 3]++;
+    s_st_itd += pb[PB_ITD_ON] != 0; s_st_lpf += pb[PB_LPF_ON] != 0;
+    s_st_auxa += (pb[PB_MIXER_CONTROL] & 0x00B0) != 0; s_st_auxb += (pb[PB_MIXER_CONTROL] & 0x1600) != 0;
+    int d = (pb[PB_FORMAT] >> 2) & 3; s_st_fmt[d < 2 ? d : 2]++;
+}
+static void stats_frame(void) {
+    if (++s_st_frames < 2000) return;  // 10 s of 5 ms frames
+    logf_("[ax] stats: %u voice-frames: src poly/lin/none %u/%u/%u coef %u/%u/%u/%u itd %u lpf %u auxA %u auxB %u "
+          "fmt adpcm/pcm/other %u/%u/%u; aux cmds %u, non-silent aux returns %u", s_st_voices, s_st_src[0], s_st_src[1], s_st_src[2], s_st_coef[0], s_st_coef[1],
+          s_st_coef[2], s_st_coef[3], s_st_itd, s_st_lpf, s_st_auxa, s_st_auxb, s_st_fmt[0], s_st_fmt[1], s_st_fmt[2], s_st_auxcmd, s_st_auxret);
+    char hist[512]; int n = 0;
+    for (int c = 0; c < 0x20; c++) if (s_st_cmd[c]) n += snprintf(hist + n, sizeof hist - n, " %02X:%u", c, s_st_cmd[c]);
+    hist[n] = 0;
+    logf_("[ax]   %u parameter blocks; commands%s", s_st_pbs, hist);
+    memset(s_st_cmd, 0, sizeof s_st_cmd); s_st_pbs = 0;
+    s_st_auxcmd = s_st_auxret = 0;
+    s_st_frames = s_st_voices = s_st_itd = s_st_lpf = s_st_auxa = s_st_auxb = 0;
+    memset(s_st_src, 0, sizeof s_st_src); memset(s_st_coef, 0, sizeof s_st_coef); memset(s_st_fmt, 0, sizeof s_st_fmt);
+}
+
 static void process_pb_list(uint32_t pb_addr) {
     uint16_t pb[PB_WORDS];
+    if (s_stats < 0) {
+        s_stats = getenv("TUROK_AX_STATS") != NULL;
+        s_linear_only = getenv("TUROK_AX_LINEAR") != NULL;
+        init_coefs();
+    }
+    if (s_stats) stats_frame();
     for (int guard = 0; pb_addr && guard < 512; guard++) {
         for (int i = 0; i < PB_WORDS; i++) pb[i] = ram16(pb_addr + 2 * i);
+        if (s_stats) stats_voice(pb);
         // per-millisecond parameter updates
         uint32_t upd = (uint32_t)pb[PB_UPD_HI] << 16 | pb[PB_UPD_LO];
         uint16_t nupd[5];
@@ -272,11 +393,14 @@ static void upload(uint32_t a, int bus) {
     for (int j = 0; j < FRAME_SAMPLES; j++) put_ram32(a + 4 * j, (uint32_t)s_bus[bus][j]);
 }
 static void add_from(uint32_t a, int bus) {
-    for (int j = 0; j < FRAME_SAMPLES; j++) s_bus[bus][j] += (int32_t)ram32(a + 4 * j);
+    int nz = 0;
+    for (int j = 0; j < FRAME_SAMPLES; j++) { int32_t v = (int32_t)ram32(a + 4 * j); s_bus[bus][j] += v; nz |= v; }
+    if (nz) s_st_auxret++;
 }
 
 static void mix_aux(int aux, uint32_t write_addr, uint32_t read_addr) {
     int base = aux ? AUXB_L : AUXA_L;
+    s_st_auxcmd++;
     if (write_addr)
         for (int k = 0; k < 3; k++) upload(write_addr + k * FRAME_SAMPLES * 4, base + k);
     add_from(read_addr, MAIN_L);
@@ -306,6 +430,7 @@ static void run_cmdlist(void) {
     uint32_t pb_addr = 0, i = 0;
     for (int guard = 0; guard < 4096; guard++) {
         uint16_t cmd = s_cmd[i++];
+        if (s_stats > 0) s_st_cmd[cmd & 0x1F]++;
         switch (cmd) {
         case 0x00: setup_processing(A32(i)); i += 2; break;
         case 0x01: {  // download + mix with volume
@@ -349,11 +474,14 @@ static void run_cmdlist(void) {
         case 0x10: {  // upload AUXB L/R, then replace them and mix into main
             uint32_t ul = A32(i), dl = A32(i + 2); i += 4;
             upload(ul, AUXB_L); upload(ul + FRAME_SAMPLES * 4, AUXB_R);
+            int32_t nz = 0;
             for (int j = 0; j < FRAME_SAMPLES; j++) {
                 int32_t l = (int32_t)ram32(dl + 4 * j), r = (int32_t)ram32(dl + FRAME_SAMPLES * 4 + 4 * j);
                 s_bus[AUXB_L][j] = l; s_bus[MAIN_L][j] += l;
                 s_bus[AUXB_R][j] = r; s_bus[MAIN_R][j] += r;
+                nz |= l | r;
             }
+            s_st_auxcmd++; s_st_auxret += nz != 0;
             break;
         }
         case 0x11: {  // opposite L/R
@@ -388,6 +516,7 @@ static void run_cmdlist(void) {
             i += 12;
             for (int k = 0; k < 3; k++) upload(auxa_up + k * FRAME_SAMPLES * 4, AUXA_L + k);
             upload(auxb_s_up, AUXB_S);
+            s_st_auxcmd++;
             add_from(dl[0], MAIN_L); add_from(dl[1], MAIN_R); add_from(dl[2], AUXB_L); add_from(dl[3], AUXB_R);
             break;
         }

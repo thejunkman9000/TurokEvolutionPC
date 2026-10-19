@@ -102,7 +102,7 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
     - The game uploads AX microcode 0x07F88145 (HashEctor; the same build as F-Zero GX / Ikaruga), 0x1F20 bytes from 0x802976A0.
     - Protocol: `BABE<size>` + command-list address → run the list → `DSP_YIELD` with an interrupt → `CDD1000x` task mail.
     - All GC AX commands are implemented.
-    - Each voice runs per 1 ms: parameter-block updates → accelerator (ADPCM / PCM8 / PCM16 from ARAM, with loop/end handling) → linear resampling → volume envelope → low-pass filter → mixing into 9 buses with ramps.
+    - Each voice runs per 1 ms: parameter-block updates → accelerator (ADPCM / PCM8 / PCM16 from ARAM, with loop/end handling) → resampling by the voice's SRC type (4-tap polyphase / linear / none) → volume envelope → low-pass filter → ITD → mixing into 9 buses with ramps.
     - Output goes to the R/L-interleaved RAM buffer at 32 kHz.
   - **AI DMA:** 0x5030/0x5036 start, 640-byte (5 ms) buffers, AIDINT on start and at each buffer boundary.
     - Played buffers go to a ring buffer (`audio_out.c`), which the host reads with `core_read_audio`.
@@ -182,12 +182,42 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - Lines and points (not used by any of the 12 sampled levels).
   - Z-buffer EFB copies.
   - Range-adjusted fog.
-  - Audio: no polyphase resampling (it needs the DSP ROM coefficients; linear is used instead), no initial time delay (ITD), and no DVD streaming audio (AI streaming is untested).
+  - Audio: the polyphase coefficients are a generated stand-in, not the DSP ROM's (see "Audio fidelity" below). The game doesn't use polyphase or ITD, so this has no audible effect.
   - TEV math is float, not 8-bit integer.
 - GX bit layouts that bit me:
   - Clear color: AR = red bits 0-7, alpha bits 8-15. GB = blue bits 0-7, green bits 8-15.
   - Scissor: y in bits 0-10, x in bits 12-22.
   - TLUT and texture addresses need masking to 0x01FFFFFF.
+
+## Audio fidelity (AX HLE)
+- **Polyphase SRC** (src_type 0) is implemented as in Dolphin's `ResampleAudio`: 4 history taps, phase = `(frac >> 9) << 2`, and `coef_select` picks one of four 128-phase tables.
+  - The real tables are in the DSP ROM, which isn't shipped.
+  - `init_coefs()` rebuilds them the way Dolphin's free DSP ROM does (`docs/DSP/free_dsp_rom/generate_coefs.py`): windowed sincs at 0.5 / 0.75 / 1.0 of Nyquist (Hamming / Kaiser β=9π/4 / Hamming), normalised to unity DC gain.
+  - Src types 1 (linear) and 2 (none) are unchanged. `TUROK_AX_LINEAR=1` forces linear for polyphase voices, for A/B.
+- **ITD** (PB words 27-33: on, buffer hi/lo, shift L/R, target L/R) delays the voice for the left and right buses by up to 31 samples each.
+  - The previous millisecond's output is kept in the voice's main-RAM buffer.
+  - Each shift moves one sample per millisecond toward its target.
+  - Surround buses get the undelayed signal.
+  - Dolphin doesn't implement ITD (it only logs a quirk), so this follows the SDK's field semantics. It isn't checked against hardware.
+- **`TUROK_AX_STATS=1`** logs, every 10 s, the running voices' SRC type, coef_select, ITD, LPF, aux sends and formats. It also logs the command histogram and whether aux returns were non-silent.
+- **What the game actually uses.** Level 1, Dark Jungle 1, RWP1, Sc-11-a and the T-rex area were checked with the stats logger:
+  - 64 parameter blocks, every running voice ADPCM, src_type 1 (**linear**), coef 0, no ITD, no LPF.
+  - So polyphase and ITD are correct for other code paths but change nothing audible in Turok.
+  - The command list is always `00 02 03 10 12 0E 0F`: setup, PB list, MixAUXBLR (aux B L/R out to the game's callback and back), compressor, output.
+  - Aux B is the reverb send: about half of the voices use it, and the returned buffers are non-silent in ~100% of gameplay frames, so the callback round trip works.
+  - Some voices set aux A sends, but the game never issues 0x04/0x13, so aux A is dropped. That's also what hardware does with this list.
+- **Intro movie audio** doesn't go through AX: no voices run during it.
+  - THP audio is mixed by the CPU into the AI DMA buffer.
+  - The periodic ~30 ms bursts in it are content, not clicks: smooth waveform, identical before and after the change.
+  - The gameplay segments of all captures have essentially no broadband click candidates.
+- **Streaming audio is not used.**
+  - The DOL links no `DVDPrepareStream*` / `DVDCancelStream*` / `AISetStreamPlayState` callers outside the SDK itself.
+  - `DVDLowAudioStream` is reached only from `stateBusy`; the AI stream volume calls come from SDK init and reset.
+  - So DI 0xE1-0xE4 and AI streaming stay stubs.
+- **Offline test:** `tools/axtest/axtest.c` includes `dsp_ax.c` and drives one voice with a PCM16 sweep.
+  - Polyphase coef 0 at ratio 0.5 leaves image energy at −38.8 dB, against −18.8 dB for linear. Coef 2 gives −20.5 dB.
+  - An ITD voice with target R=20 gives a right channel that equals the left delayed by exactly 20 samples once ramped.
+  - `tools/axtest/srcplot.py` draws the spectrograms. Captures and plots go to `analysis/audio_captures/` (ignored).
 
 ## Next steps
 1. ~~dtk setup~~ and ~~SDK naming~~ are done (see above).
