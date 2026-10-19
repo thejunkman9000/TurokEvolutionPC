@@ -91,7 +91,7 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
     - `TUROK_SCREENSHOT=f1,f2,...`: capture those frames.
     - `TUROK_GXDUMP=frame`: log every draw of that frame.
     - `TUROK_DUMP_TEXTURES=frame`: write that frame's textures plus `batches.txt`.
-    - `TUROK_DEBUG_VIEW=1|2|3|4`: stage-0 texture, UV, lit color, or fog amount.
+    - `TUROK_DEBUG_VIEW=1|2|3|4|5|6`: stage-0 texture, UV, lit color, fog amount, indirect draws in magenta, or indirect draws with no depth test (to see occluded water).
     - Stick tokens for `TUROK_INPUT`: `LX+` `LX-` `LY+` `LY-` `CX+` `CX-` `CY+` `CY-`.
     - `TUROK_CULL_FLIP=1`: swap the cull windings.
     - Core only: `TUROK_ONLY_VAT=n` and `TUROK_LOG_REDIRECT=1`.
@@ -143,7 +143,7 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
 - **Indirect texturing (bump)** follows Dolphin's integer semantics:
   - Indirect stages are sampled at shifted coordinates, then each stage's format, bias and bump alpha are applied, followed by the static or S/T-dynamic matrices and the wrap/add-previous steps, with s24 wrap.
   - Stages sample with explicit gradients. Setup-unit texcoord sizes come from BP 0x30+.
-  - Used by about 25 draws per frame in level 1 (the river by the bridge). Not visually verified yet. `TUROK_DEBUG_VIEW=5` shows indirect draws in magenta.
+  - Used by about 25 draws per frame in level 1 (the river by the bridge). `TUROK_DEBUG_VIEW=5` shows indirect draws in magenta.
 - **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--widescreen] [--no-vsync] [--level <atr path>]`. F11 or Alt+Enter toggles borderless fullscreen.
 - **Widescreen:** the EFB is 854 wide. Perspective draws whose viewport spans the full 640 width are stretched across it, with the projection's X row scaled by 640/854. Every other draw, and any EFB copy narrower than full width (such as the shadow map), stays 4:3 and is shifted to the center.
 - **Mouse look:** click inside the window to capture the mouse, Esc to release. Motion turns the view directly through `core_mouse_look`, not through the C-stick. Left/right buttons map to R/L. `--mouse-sens X` scales it (0.0022 rad/pixel at 1).
@@ -178,12 +178,25 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - No level uses lines, points or Z copies.
   - Indirect texturing appears in Dark Jungle and the escape flight.
 - **Build:** `build.ps1 -Iso <path>` builds a clean clone end to end (verified): extract the DOL, generate C, MSVC via vswhere + CMake/Ninja (run through a temporary .cmd), install mgfxc locally, build the host.
+- **Rendering accuracy pass:**
+  - **Indirect + EFB copies:** indirect stages address textures in guest texels (`TexSize`), but EFB copies are render targets upscaled by `--scale` (and widened in widescreen). The shader used the target's size, so Dark Jungle's and the escape flight's full-screen distortion pass sampled the top-left quarter of the scene copy: the whole 3D view looked zoomed in 2x. The host now tracks each copy's guest size.
+  - The indirect math was rechecked line by line against Dolphin (abg lookup, format shifts/bias, alpha bump, s.10 matrices with the 17-scale shift, S/T dynamic matrices, wrap, add-previous, s24 wrap). No other bugs found.
+    - Level 1's river is a static-matrix bump (`[[25,0,0],[0,25,0]]`, scale 18) of a 32x32 water texture by a 32x32 IA texture. It renders as flowing streaks. It sits behind the treeline ahead of the start; `TUROK_DEBUG_VIEW=6` shows it.
+    - `TUROK_DUMP_TEXTURES` now lists each indirect batch's setup and EFB-copy refs in `batches.txt`.
+  - **TEV is integer now** (Dolphin's semantics):
+    - a/b/c take the low 8 bits of their input, and d the full s11 value.
+    - Lerp: C widened to 0..256, bias on D, scale folded into the lerp with the hardware's +127/128 rounding, then /2 for scale 1/2.
+    - Clamp to 0..255 or -1024..1023.
+    - The last stage's output wraps to 8 bits.
+    - Alpha test and the fog blend (`ifog = round(f*256)`, `>> 8`) are integer.
+    - Visible change is small: at most 1-2 levels on movies and menus. In-game differences are confined to alpha-test edges and animated objects. No banding or brightness regressions on the menus, level 1 or sc-11-a.
+  - **Range-adjusted fog** (BP 0xE8 bit 10) is logged as `[fog] range adjust on` and is still not implemented. No level enables it (one level per pod checked, plus level 1, Dark Jungle and sc-11-a).
+  - Every level checked uses an RGB8 EFB (`[pe]` log), so RGBA6 6-bit quantization/dither is not needed.
 - Known gaps:
   - Lines and points (not used by any of the 12 sampled levels).
   - Z-buffer EFB copies.
-  - Range-adjusted fog.
+  - Range-adjusted fog (no sampled level uses it; logged if one does).
   - Audio: no polyphase resampling (it needs the DSP ROM coefficients; linear is used instead), no initial time delay (ITD), and no DVD streaming audio (AI streaming is untested).
-  - TEV math is float, not 8-bit integer.
 - GX bit layouts that bit me:
   - Clear color: AR = red bits 0-7, alpha bits 8-15. GB = blue bits 0-7, green bits 8-15.
   - Scissor: y in bits 0-10, x in bits 12-22.
