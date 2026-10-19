@@ -45,6 +45,9 @@ internal sealed class TurokGame : Game
 
     private string _status = "starting";
     private bool _fullscreenKeyHeld;
+    // Mouse look: click in the window to capture the mouse, Esc to release.
+    private bool _mouseCaptured;
+    private const float MouseSensitivity = 0.06f;  // stick deflection per pixel per update
     private readonly float _debugView = float.TryParse(Environment.GetEnvironmentVariable("TUROK_DEBUG_VIEW"), out var dv) ? dv : 0;
     private readonly List<int> _screenshotFrames = new();
     private bool _screenshotPending;
@@ -178,13 +181,39 @@ internal sealed class TurokGame : Game
         float lx = gp.ThumbSticks.Left.X, ly = gp.ThumbSticks.Left.Y;
         if (kb.IsKeyDown(Keys.A)) lx = -1; if (kb.IsKeyDown(Keys.D)) lx = 1;
         if (kb.IsKeyDown(Keys.W)) ly = 1;  if (kb.IsKeyDown(Keys.S)) ly = -1;
-        float lt = Math.Max(gp.Triggers.Left, kb.IsKeyDown(Keys.Z) ? 1f : 0f);
-        float rt = Math.Max(gp.Triggers.Right, Mouse.GetState().LeftButton == ButtonState.Pressed ? 1f : 0f);
+        var mouse = Mouse.GetState();
+        var center = new Point(Window.ClientBounds.Width / 2, Window.ClientBounds.Height / 2);
+        if (!_mouseCaptured && IsActive && mouse.LeftButton == ButtonState.Pressed &&
+            Window.ClientBounds.Contains(Window.ClientBounds.X + mouse.X, Window.ClientBounds.Y + mouse.Y))
+        {
+            _mouseCaptured = true;
+            IsMouseVisible = false;
+            Mouse.SetPosition(center.X, center.Y);
+            mouse = Mouse.GetState();
+        }
+        if (_mouseCaptured && (kb.IsKeyDown(Keys.Escape) || !IsActive))
+        {
+            _mouseCaptured = false;
+            IsMouseVisible = true;
+        }
+        float mdx = 0, mdy = 0;
+        if (_mouseCaptured)
+        {
+            mdx = (mouse.X - center.X) * MouseSensitivity;
+            mdy = -(mouse.Y - center.Y) * MouseSensitivity;
+            Mouse.SetPosition(center.X, center.Y);
+        }
+        bool mouseFire = _mouseCaptured && mouse.LeftButton == ButtonState.Pressed;
+        bool mouseAlt = _mouseCaptured && mouse.RightButton == ButtonState.Pressed;
+        float lt = Math.Max(gp.Triggers.Left, kb.IsKeyDown(Keys.Z) || mouseAlt ? 1f : 0f);
+        float rt = Math.Max(gp.Triggers.Right, mouseFire ? 1f : 0f);
         if (lt > 0.9f) b |= PadButtons.L;
         if (rt > 0.9f) b |= PadButtons.R;
         float cx = gp.ThumbSticks.Right.X, cy = gp.ThumbSticks.Right.Y;
         if (kb.IsKeyDown(Keys.J)) cx = -1; if (kb.IsKeyDown(Keys.L)) cx = 1;
         if (kb.IsKeyDown(Keys.I)) cy = 1;  if (kb.IsKeyDown(Keys.K)) cy = -1;
+        if (Math.Abs(mdx) > Math.Abs(cx)) cx = Math.Clamp(mdx, -1f, 1f);
+        if (Math.Abs(mdy) > Math.Abs(cy)) cy = Math.Clamp(mdy, -1f, 1f);
         foreach (var (frame, button, hold) in _script)
             if (_framesReceived >= frame && _framesReceived < frame + hold) b |= button;
         foreach (var (frame, axis, hold) in _stickScript)
