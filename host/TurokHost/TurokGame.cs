@@ -68,6 +68,8 @@ internal sealed class TurokGame : Game
     // Mouse look: click in the window to capture the mouse, Esc to release.
     private bool _mouseCaptured;
     private bool _escHeld;
+    private bool _f3Held, _f4Held, _alphaLightOff, _captureNext;
+    private int _captureFrame = -1;
     private Effect? _presentFx;
     private readonly Settings _settings = Settings.Load();
     private Keys _pictureKeyHeld;
@@ -281,6 +283,18 @@ internal sealed class TurokGame : Game
         var kb = Keyboard.GetState();
         var gp = GamePad.GetState(PlayerIndex.One);
         if (kb.IsKeyDown(Keys.F12)) _screenshotPending = true;
+        // Debug: F3 toggles light-driven alpha (distance fades); F4 saves a capture of the
+        // next frame (screenshot, textures, per-draw details, GX command log).
+        bool f3 = kb.IsKeyDown(Keys.F3), f4 = kb.IsKeyDown(Keys.F4);
+        if (f3 && !_f3Held && IsActive)
+        {
+            Core.DebugToggle(1);
+            _alphaLightOff = !_alphaLightOff;
+            _pictureMessage = _alphaLightOff ? "debug: light-driven alpha OFF (F3)" : "debug: light-driven alpha on (F3)";
+            _pictureMessageUntil = Environment.TickCount64 + 3000;
+        }
+        if (f4 && !_f4Held && IsActive) { Core.RequestGxDump(); _captureNext = true; }
+        _f3Held = f3; _f4Held = f4;
         bool toggle = kb.IsKeyDown(Keys.F11) ||
                       (kb.IsKeyDown(Keys.Enter) && (kb.IsKeyDown(Keys.LeftAlt) || kb.IsKeyDown(Keys.RightAlt)));
         if (toggle && !_fullscreenKeyHeld && IsActive) _graphics.ToggleFullScreen();
@@ -996,6 +1010,8 @@ internal sealed class TurokGame : Game
                              $"mtx {m.IndMtx[0]} {m.IndMtx[1]} size {m.CoordSize[0]} copies [{string.Join(",", b.CopyRefs)}] vp {b.Viewport}" : ""));
             }
         }
+        if (Environment.GetEnvironmentVariable("TUROK_CAPTURE") == _framesReceived.ToString() && _captureFrame != _framesReceived) _captureNext = true;
+        if (_captureNext && _framesReceived != _captureFrame) { _captureNext = false; _captureFrame = _framesReceived; DebugCapture(); }
         if (_ramDumpFrames.Remove(_framesReceived)) DumpRam(_framesReceived);
         foreach (var p in _pokes) if (p.frame == _framesReceived) PokeAdd(p.addr, p.add);
         bool scheduled = _screenshotFrames.Remove(_framesReceived);
@@ -1023,5 +1039,38 @@ internal sealed class TurokGame : Game
         float v = BitConverter.UInt32BitsToSingle(w) + add;
         w = BitConverter.SingleToUInt32Bits(v);
         p[0] = (byte)(w >> 24); p[1] = (byte)(w >> 16); p[2] = (byte)(w >> 8); p[3] = (byte)w;
+    }
+
+    // F4: everything needed to diagnose a rendering problem in one folder.
+    private unsafe void DebugCapture()
+    {
+        var dir = Path.Combine(AppContext.BaseDirectory, "captures", DateTime.Now.ToString("yyyy-MM-dd HHmmss"));
+        Directory.CreateDirectory(dir);
+        using (var fs = File.Create(Path.Combine(dir, "screen.png"))) _target!.SaveAsPng(fs, _target.Width, _target.Height);
+        foreach (var (id, e) in _textures)
+            if (e.LastUsed == _framesReceived)
+                using (var fs = File.Create(Path.Combine(dir, $"tex_{id:D5}.png"))) e.Tex.SaveAsPng(fs, e.Tex.Width, e.Tex.Height);
+        using var bw = new StreamWriter(Path.Combine(dir, "draws.txt"));
+        bw.WriteLine($"frame {_framesReceived}; alpha lighting {(_alphaLightOff ? "off" : "on")}");
+        for (int i = 0; i < _batches.Count; i++)
+        {
+            var b = _batches[i];
+            if (b.Kind != 0) { bw.WriteLine($"{i} EFB copy id {b.CopyId} mode {b.CopyMode} src {b.CopySrc}"); continue; }
+            var m = _materials[b.Material];
+            float zmin = float.MaxValue, zmax = float.MinValue; int a0min = 255, a0max = 0, a1min = 255, a1max = 0;
+            for (int v = b.First; v < b.First + b.Count; v++)
+            {
+                var t = _vertices[v];
+                zmin = Math.Min(zmin, t.Position.Z); zmax = Math.Max(zmax, t.Position.Z);
+                a0min = Math.Min(a0min, t.Color0.A); a0max = Math.Max(a0max, t.Color0.A);
+                a1min = Math.Min(a1min, t.Color1.A); a1max = Math.Max(a1max, t.Color1.A);
+            }
+            var bl = m.Blend;
+            bw.WriteLine($"{i} verts {b.Count} z {zmin:F1}..{zmax:F1} c0.a {a0min}-{a0max} c1.a {a1min}-{a1max} maps [{string.Join(",", b.TextureIds)}] " +
+                         $"stages {m.Misc.Y} alphaTest {m.AlphaTest} blend {bl.ColorSourceBlend}/{bl.ColorDestinationBlend} " +
+                         $"alphaIn0 {m.AlphaIn[0]} alphaOp0 {m.AlphaOp[0]} stage0 {m.Stage[0]} konst0 {m.Konst[0]} depth {m.Depth.DepthBufferEnable}/{m.Depth.DepthBufferWriteEnable}");
+        }
+        _pictureMessage = "debug capture saved to " + dir;
+        _pictureMessageUntil = Environment.TickCount64 + 4000;
     }
 }

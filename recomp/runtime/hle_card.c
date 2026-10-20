@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdlib.h>
 #include "ppc.h"
 #include "host.h"
 #include "hw.h"
@@ -65,9 +66,50 @@ static void file_path(const CardFile *f, char *out, size_t n) {
     snprintf(out, n, "%s\\%.2s-%.4s-%s.gci", s_dir_path, (const char *)f->dir + 4, (const char *)f->dir, name);
 }
 
+// Before a save is overwritten, keep the previous version in Backups\ (once per save
+// session: only if the file wasn't written in the last minute); the newest 20 are kept.
+static void backup_before_write(const char *path) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    uint64_t t_now = (uint64_t)now.dwHighDateTime << 32 | now.dwLowDateTime;
+    uint64_t t_file = (uint64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
+    if (t_now - t_file < 60ull * 10000000ull) return;  // same save session
+    char dir[MAX_PATH], base[MAX_PATH], dst[MAX_PATH];
+    snprintf(dir, sizeof dir, "%s\\Backups", s_dir_path);
+    CreateDirectoryA(dir, NULL);
+    const char *name = strrchr(path, '\\');
+    snprintf(base, sizeof base, "%s", name ? name + 1 : path);
+    char *dot = strrchr(base, '.');
+    if (dot) *dot = 0;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(dst, sizeof dst, "%s\\%s %04d-%02d-%02d %02d%02d%02d.gci", dir, base, st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond);
+    if (CopyFileA(path, dst, TRUE)) logf_("[card] backed up %s", dst);
+    // Keep the newest 20 backups of this save (names sort by date).
+    static char names[64][MAX_PATH];
+    char pattern[MAX_PATH];
+    int n = 0;
+    snprintf(pattern, sizeof pattern, "%s\\%s *.gci", dir, base);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do { if (n < 64) snprintf(names[n++], MAX_PATH, "%s", fd.cFileName); } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    qsort(names, (size_t)n, MAX_PATH, (int (*)(const void *, const void *))strcmp);
+    for (int i = 0; i + 20 < n; i++) {
+        char old[MAX_PATH];
+        snprintf(old, sizeof old, "%s\\%s", dir, names[i]);
+        DeleteFileA(old);
+    }
+}
+
 static void save_file(const CardFile *f) {
     char path[MAX_PATH];
     file_path(f, path, sizeof path);
+    backup_before_write(path);
     FILE *fp = fopen(path, "wb");
     if (!fp) { logf_("[card] cannot write %s", path); return; }
     fwrite(f->dir, 1, 64, fp);
@@ -82,6 +124,10 @@ static void load_all(void) {
     GetModuleFileNameA(NULL, exe, sizeof exe);
     char *slash = strrchr(exe, '\\'); if (slash) *slash = 0;
     snprintf(s_dir_path, sizeof s_dir_path, "%s\\saves", exe);
+    // TUROK_SAVE_DIR: use another folder (automated test runs must never touch real saves).
+    char alt[MAX_PATH];
+    DWORD an = GetEnvironmentVariableA("TUROK_SAVE_DIR", alt, sizeof alt);
+    if (an && an < sizeof alt) snprintf(s_dir_path, sizeof s_dir_path, "%s", alt);
     CreateDirectoryA(s_dir_path, NULL);
     strcat(s_dir_path, "\\GTKE51"); CreateDirectoryA(s_dir_path, NULL);
     strcat(s_dir_path, "\\Card A"); CreateDirectoryA(s_dir_path, NULL);

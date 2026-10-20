@@ -117,6 +117,8 @@ CORE_API void core_release_frame(void);
 
 // Debug: log every draw of the next frame the core completes to the log file.
 CORE_API void core_request_gx_dump(void);
+// Debug toggles: 1 = light-driven alpha (distance fades) on/off.
+CORE_API void core_debug_toggle(int which);
 
 // Debug: guest main RAM (big-endian, 24 MB at physical 0); size in *size.
 CORE_API const uint8_t *core_ram(uint32_t *size);

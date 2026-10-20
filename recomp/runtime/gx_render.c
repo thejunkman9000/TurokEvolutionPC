@@ -537,6 +537,33 @@ static void accumulate_lights(const XfSnap *x, uint32_t ctl, const float pos[3],
     }
 }
 
+// Debug (TUROK_LIGHTLOG=1): alpha channels driven by lights, e.g. distance fades.
+// Logs each distinct light setup once with a sample vertex distance and result.
+int g_light_log = -1;
+// Debug: alpha channels ignore lights (distance fades off). TUROK_NOALPHALIGHT=1 or
+// core_debug_toggle(1) (host F3).
+volatile int g_no_alpha_light = -1;
+CORE_API void core_debug_toggle(int which) {
+    if (which == 1) g_no_alpha_light = g_no_alpha_light > 0 ? 0 : 1;
+    logf_("[debug] alpha lighting %s", g_no_alpha_light > 0 ? "off" : "on");
+}
+static void light_log(const XfSnap *x, uint32_t ctl, const float pos[3], float a, float mat) {
+    static uint32_t seen[64]; static int nseen;
+    uint32_t mask = ((ctl >> 2) & 15) | ((ctl >> 11) & 15) << 4;
+    for (int i = 0; i < 8; i++) {
+        if (!(mask & (1u << i))) continue;
+        const float *lt = x->light[i];
+        uint32_t key = (uint32_t)(lt[7] * 1000) ^ (uint32_t)(lt[8] * 100000) * 31 ^ (uint32_t)(lt[9] * 1e7f) * 131 ^ ctl * 7;
+        int dup = 0;
+        for (int j = 0; j < nseen; j++) if (seen[j] == key) dup = 1;
+        if (dup || nseen >= 64) continue;
+        seen[nseen++] = key;
+        float d = sqrtf((lt[10] - pos[0]) * (lt[10] - pos[0]) + (lt[11] - pos[1]) * (lt[11] - pos[1]) + (lt[12] - pos[2]) * (lt[12] - pos[2]));
+        logf_("[lightlog] alpha ctl %03X light %d attn %u cos %.4f %.4f %.4f dist %.5f %.5f %.6f lpos %.1f %.1f %.1f dir %.2f %.2f %.2f | vtx d %.2f -> a %.3f (mat %.2f)",
+              ctl, i, (ctl >> 9) & 3, lt[4], lt[5], lt[6], lt[7], lt[8], lt[9], lt[10], lt[11], lt[12], lt[13], lt[14], lt[15], d, a, mat);
+    }
+}
+
 static uint32_t light_channel(const XfSnap *x, int chan, const RawVtx *r, const float pos[3], const float n[3]) {
     uint32_t cctl = x->cctl[chan], actl = x->actl[chan];
     float vtx[4] = {1, 1, 1, 1};
@@ -548,10 +575,12 @@ static uint32_t light_channel(const XfSnap *x, int chan, const RawVtx *r, const 
         uint32_t ctl = pass ? actl : cctl;
         int c0 = pass ? 3 : 0, c1 = pass ? 4 : 3;
         const float *mat = (ctl & 1) ? vtx : matreg;
-        if (!(ctl & 2)) { for (int k = c0; k < c1; k++) out[k] = mat[k]; continue; }
+        if (g_no_alpha_light < 0) g_no_alpha_light = getenv("TUROK_NOALPHALIGHT") != NULL;
+        if (!(ctl & 2) || (pass && g_no_alpha_light)) { for (int k = c0; k < c1; k++) out[k] = mat[k]; continue; }
         const float *amb = (ctl & 0x40) ? vtx : ambreg;
         float lacc[4] = {amb[0], amb[1], amb[2], amb[3]};
         accumulate_lights(x, ctl, pos, n, lacc, c0, c1);
+        if (pass) { if (g_light_log < 0) g_light_log = getenv("TUROK_LIGHTLOG") != NULL; if (g_light_log) light_log(x, ctl, pos, lacc[3], mat[3]); }
         for (int k = c0; k < c1; k++) out[k] = mat[k] * clamp01(lacc[k]);
     }
     uint32_t res = 0;

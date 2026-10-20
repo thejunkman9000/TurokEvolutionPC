@@ -131,6 +131,9 @@ internal static unsafe partial class Core
     [LibraryImport(Dll, EntryPoint = "core_vsync")]
     public static partial void VSync();
 
+    [LibraryImport(Dll, EntryPoint = "core_debug_toggle")]
+    public static partial void DebugToggle(int which);
+
     [LibraryImport(Dll, EntryPoint = "core_set_speed")]
     public static partial void SetSpeed(float speed);
 

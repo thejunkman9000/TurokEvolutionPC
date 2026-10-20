@@ -322,3 +322,14 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - Min-linear mipmapped samplers are upgraded to 8x anisotropic, which is trilinear.
   - In the TEV shader, the coarsest sampled LOD (from the explicit gradients, clamped to the uploaded level count in `TexSize.z`) boosts the alpha used for GREATER/GEQUAL alpha tests by 30% per level.
   - Result: the level 1 canopy is visibly fuller at a distance, with no blocky edges.
+
+## Saves: backups and test isolation
+
+- **Incident (2026-10-19):** the user's progress (a couple of levels) was replaced by a fresh level-1 save. The cause was my automated test runs, not the game's autosave: they started a New Game, answered "Yes" to the overwrite prompt, and used the real `saves\` folder. Save Game0.gci was last written at 22:21:26, between the two texture-comparison runs.
+- **Fixes:**
+  - `TUROK_SAVE_DIR` points the card at another folder. Every scripted run must set it.
+  - The card HLE copies a save into `Card A\Backups\<name> <date time>.gci` before the first write of a save session (the file not written in the last minute), keeping the newest 20 per save.
+- **Bushes vanishing up close (user report).** This needs a capture from the spot.
+  - A walking script couldn't reach it.
+  - One light-driven alpha setup exists: light 7, spot attenuation, at the camera, cos (-8.73, 1000, 0), dist (1, 0, 1.083), dir view-up. My attenuation matches Dolphin's formulas.
+  - Debug keys added: F3 toggles light-driven alpha (`core_debug_toggle(1)` / `TUROK_NOALPHALIGHT=1`). F4 (or `TUROK_CAPTURE=<frame>`) writes `captures\<time>\` with screen.png, the frame's textures, and draws.txt (per draw: z range, vertex alpha ranges, alpha test, blend, stage-0 alpha inputs, depth), plus a GX dump in the log. `TUROK_LIGHTLOG=1` logs light-driven alpha setups.
