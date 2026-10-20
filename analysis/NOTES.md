@@ -310,3 +310,15 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - The front end runs at 4x until `mainmenu` loads.
   - The PAD HLE taps Start ~1 s after the title screen loads.
   - The main menu appears within a few seconds. Scripted test runs pass `TUROK_SKIP_INTRO=0` to keep the original boot timing.
+
+## Picture controls and texture enhancements
+
+- **Present pass:** `Shaders/Present.fx` applies gamma, then contrast around mid-grey, then brightness gain when scaling the EFB into the window. Settings live in `settings.json` (Settings.cs). F5-F10 adjust them, and the title bar shows the values. Screenshots (F12) stay raw EFB.
+- **Distant foliage "pop-in"** (user report: palm fronds in level 1):
+  - These are alpha-tested cut-outs. Their smaller mip levels average thin leaflets below the alpha threshold, so fronds thin out with distance and pop at mip-point transitions.
+  - TX_SETMODE1's max LOD is already honoured, through the number of uploaded levels.
+  - No geometry LOD keywords were found in the DOL or archive strings. The "partdef visible near/far" fields (fn_8005C740) belong to particle effects.
+- **Fixes (default on; `--original-textures` off):**
+  - Min-linear mipmapped samplers are upgraded to 8x anisotropic, which is trilinear.
+  - In the TEV shader, the coarsest sampled LOD (from the explicit gradients, clamped to the uploaded level count in `TexSize.z`) boosts the alpha used for GREATER/GEQUAL alpha tests by 30% per level.
+  - Result: the level 1 canopy is visibly fuller at a distance, with no blocky edges.

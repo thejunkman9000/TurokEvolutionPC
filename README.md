@@ -60,6 +60,9 @@ Click in the window to capture the mouse; the mouse turns the view directly, lik
 | Fullscreen | F11 or Alt+Enter | |
 | Screenshot | F12 | |
 | Fast-forward (4x, while held) | Tab | |
+| Brightness down / up | F5 / F6 | |
+| Contrast down / up | F7 / F8 | |
+| Gamma down / up | F9 / F10 | |
 
 The modern layout applies while you control the player; in menus and cutscenes the buttons pass
 straight through (A/B/X/Y = A/B/X/Y). The game ships with *Invert Look* on, so the controller's right
@@ -70,6 +73,15 @@ Startup and speed:
 - The logos, legal screens and intro movie are skipped by default; the game starts at the main menu within a few
   seconds. `--show-intro` plays them.
 - `--speed 2` runs the whole game at double speed; hold Tab to fast-forward 4x (sound is muted while sped up).
+
+Picture: brightness, contrast and gamma (F5-F10) show their values in the title bar and are saved to
+`settings.json` next to the executable. The default gamma is 1.15, a small mid-tone lift because the game was
+tuned for CRT TVs.
+
+Texture enhancements (on by default, `--original-textures` for the hardware look):
+- 8x anisotropic and trilinear filtering on mipmapped textures.
+- Alpha-tested foliage keeps its coverage at a distance: distant palm fronds and leaves no longer thin out or pop
+  between mip levels.
 
 Smoothness: the game runs at 60 fps. On a 60 Hz display its frames are paced by the display's refresh. On faster
 displays (120/144 Hz) mouse look still turns at the full refresh rate: each refresh redraws the latest game frame

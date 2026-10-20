@@ -31,7 +31,8 @@ float4 IndMtx[6];     // rows of the 3 indirect matrices; w = shift
 float4 IndStage[4];   // tex map, texcoord, s shift, t shift
 float4 CoordSize[8];  // setup-unit size per texcoord
 float4 IndMisc;       // number of indirect stages, indirect path enabled
-float4 TexSize[8];    // dimensions of each bound tex map
+float4 TexSize[8];    // dimensions of each bound tex map; z = mip level count
+float4 Enhance;       // x: alpha-test coverage boost per mip level (0 = hardware behaviour)
 
 Texture2D Tex0; sampler2D Samp0 = sampler_state { Texture = <Tex0>; };
 Texture2D Tex1; sampler2D Samp1 = sampler_state { Texture = <Tex1>; };
@@ -196,6 +197,7 @@ float4 MainPS(VSOut i) : COLOR0
     int4 reg[4] = { int4(round(Regs[0] * 255.0)), int4(round(Regs[1] * 255.0)),
                     int4(round(Regs[2] * 255.0)), int4(round(Regs[3] * 255.0)) };
     int4 result = reg[0];
+    float maxLod = 0.0;  // coarsest mip level sampled (for the alpha-test coverage boost)
     int n = (int)Misc.y;
 
     [loop]
@@ -242,6 +244,9 @@ float4 MainPS(VSOut i) : COLOR0
             {
                 int map = (int)st.x;
                 tex = SampleMapGrad(map, float2(tevcoord) / (128.0 * TexSize[map].xy), duvdx[coord], duvdy[coord]);
+                float2 gx = duvdx[coord] * TexSize[map].xy, gy = duvdy[coord] * TexSize[map].xy;
+                float lod = 0.5 * log2(max(max(dot(gx, gx), dot(gy, gy)), 1e-8));
+                maxLod = max(maxLod, clamp(lod, 0.0, max(TexSize[map].z - 1.0, 0.0)));
             }
         }
         int4 itex = ISwizzle(Q8(tex), SwapTable[(int)sw.y]);
@@ -273,8 +278,14 @@ float4 MainPS(VSOut i) : COLOR0
     // the last stage's output is what leaves the TEV, wrapped to 8 bits
     result &= 255;
 
-    bool p0 = AlphaCompare(result.a, (int)round(AlphaTest.x * 255.0), AlphaTest.z);
-    bool p1 = AlphaCompare(result.a, (int)round(AlphaTest.y * 255.0), AlphaTest.w);
+    // Alpha-tested cut-outs (foliage, fences) lose coverage in their smaller mip levels,
+    // where thin shapes average below the threshold and vanish with distance. Boost the
+    // alpha used for a "greater" test by the mip level (Enhance.x per level) to keep it.
+    int testA = result.a;
+    if (Enhance.x > 0.0 && (AlphaTest.z == 4.0 || AlphaTest.z == 6.0) && maxLod > 0.0)
+        testA = min(255, (int)(result.a * (1.0 + Enhance.x * maxLod)));
+    bool p0 = AlphaCompare(testA, (int)round(AlphaTest.x * 255.0), AlphaTest.z);
+    bool p1 = AlphaCompare(AlphaTest.w == 4.0 || AlphaTest.w == 6.0 ? testA : result.a, (int)round(AlphaTest.y * 255.0), AlphaTest.w);
     bool ok;
     if (Misc.x == 0.0) ok = p0 && p1;
     else if (Misc.x == 1.0) ok = p0 || p1;

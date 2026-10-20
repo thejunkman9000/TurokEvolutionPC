@@ -68,6 +68,11 @@ internal sealed class TurokGame : Game
     // Mouse look: click in the window to capture the mouse, Esc to release.
     private bool _mouseCaptured;
     private bool _escHeld;
+    private Effect? _presentFx;
+    private readonly Settings _settings = Settings.Load();
+    private Keys _pictureKeyHeld;
+    private string? _pictureMessage;
+    private double _pictureMessageUntil;
     private readonly float _baseSpeed;
     private float _speed = 1f;  // effective game speed (Tab fast-forward, intro skip)
     private const float FastForward = 4f;
@@ -206,10 +211,42 @@ internal sealed class TurokGame : Game
             s.CopyTo(ms);
             _copyFx = new Effect(GraphicsDevice, ms.ToArray());
         }
+        using (var s = typeof(TurokGame).Assembly.GetManifestResourceStream("Present.mgfxo")!)
+        using (var ms = new MemoryStream())
+        {
+            s.CopyTo(ms);
+            _presentFx = new Effect(GraphicsDevice, ms.ToArray());
+        }
         _clearFx = new BasicEffect(GraphicsDevice) { VertexColorEnabled = true, World = Matrix.Identity,
                                                      View = Matrix.Identity, Projection = Matrix.Identity };
         _white = new Texture2D(GraphicsDevice, 1, 1);
         _white.SetData(new[] { Color.White });
+    }
+
+    // Picture adjustments: F5/F6 brightness, F7/F8 contrast, F9/F10 gamma (down/up),
+    // shown in the title bar and saved to settings.json.
+    private void PictureKeys(KeyboardState kb)
+    {
+        (Keys key, int which, float step)[] map =
+        {
+            (Keys.F5, 0, -0.05f), (Keys.F6, 0, 0.05f), (Keys.F7, 1, -0.05f), (Keys.F8, 1, 0.05f),
+            (Keys.F9, 2, -0.05f), (Keys.F10, 2, 0.05f),
+        };
+        Keys down = Keys.None;
+        foreach (var (key, which, step) in map)
+        {
+            if (!kb.IsKeyDown(key)) continue;
+            down = key;
+            if (key == _pictureKeyHeld || !IsActive) break;
+            if (which == 0) _settings.Brightness = Math.Clamp(_settings.Brightness + step, 0.5f, 2f);
+            if (which == 1) _settings.Contrast = Math.Clamp(_settings.Contrast + step, 0.5f, 2f);
+            if (which == 2) _settings.Gamma = Math.Clamp(_settings.Gamma + step, 0.5f, 2.5f);
+            _settings.Save();
+            _pictureMessage = $"brightness {_settings.Brightness:F2}  contrast {_settings.Contrast:F2}  gamma {_settings.Gamma:F2}";
+            _pictureMessageUntil = Environment.TickCount64 + 3000;
+            break;
+        }
+        _pictureKeyHeld = down;
     }
 
     private void SetMouseCapture(bool on)
@@ -249,6 +286,7 @@ internal sealed class TurokGame : Game
         if (toggle && !_fullscreenKeyHeld && IsActive) _graphics.ToggleFullScreen();
         _fullscreenKeyHeld = toggle;
         bool altHeld = kb.IsKeyDown(Keys.LeftAlt) || kb.IsKeyDown(Keys.RightAlt);
+        PictureKeys(kb);
 
         // Modern PC/console FPS controls mapped onto the game's default "FPS" layout
         // (Options > Control Setup): stick move/strafe, C-stick turn/look, R fire,
@@ -393,7 +431,8 @@ internal sealed class TurokGame : Game
             CoreState.Running => $"running - frame {_framesReceived}",
             _ => _status,
         };
-        Window.Title = "Turok: Evolution (recompiled) - " + _status;
+        Window.Title = "Turok: Evolution (recompiled) - " +
+                       (_pictureMessage != null && Environment.TickCount64 < _pictureMessageUntil ? _pictureMessage : _status);
         base.Update(gameTime);
     }
 
@@ -700,6 +739,8 @@ internal sealed class TurokGame : Game
     // TX_SETMODE0: wrap s 0-1, wrap t 2-3 (0 clamp, 1 repeat, 2 mirror), bit4 linear mag filter,
     // min filter 5-7 (0 near, 1 near-mip-near, 2 near-mip-lin, 4 lin, 5 lin-mip-near, 6 lin-mip-lin),
     // LOD bias 9-16 (signed, 1/32 units)
+    internal static bool s_enhanceTextures = true;
+
     private static SamplerState Sampler(uint mode)
     {
         uint key = mode & 0x1FFFF;
@@ -710,6 +751,7 @@ internal sealed class TurokGame : Game
         };
         bool mag = (mode & 16) != 0;
         uint minf = (mode >> 5) & 7;
+        // TX_SETMODE0 min filter: 0 near, 1 near-mip-near, 2 near-mip-lin, 4 lin, 5 lin-mip-near, 6 lin-mip-lin
         bool min = minf >= 4, mip = minf == 2 || minf == 6;
         var filter = (min, mag, mip) switch
         {
@@ -722,11 +764,16 @@ internal sealed class TurokGame : Game
             (false, true, true) => TextureFilter.MinPointMagLinearMipLinear,
             _ => TextureFilter.MinPointMagLinearMipPoint,
         };
+        // Enhancement (default; --original-textures turns it off): linear-minified mipmapped
+        // textures get trilinear + 8x anisotropic filtering, so distant surfaces stay sharp
+        // and mip transitions blend instead of popping.
+        bool upgrade = s_enhanceTextures && min && (minf == 5 || minf == 6);
         s = new SamplerState
         {
             AddressU = Wrap(mode & 3),
             AddressV = Wrap((mode >> 2) & 3),
-            Filter = filter,
+            Filter = upgrade ? TextureFilter.Anisotropic : filter,
+            MaxAnisotropy = upgrade ? 8 : 4,
             MipMapLevelOfDetailBias = (sbyte)((mode >> 9) & 0xFF) / 32f,
         };
         SamplerCache[key] = s;
@@ -888,6 +935,7 @@ internal sealed class TurokGame : Game
             P["Stage"].SetValue(m.Stage); P["Swap"].SetValue(m.Swap); P["Konst"].SetValue(m.Konst);
             P["SwapTable"].SetValue(m.SwapTable); P["Regs"].SetValue(m.Regs); P["MapCoord"].SetValue(m.MapCoord);
             P["AlphaTest"].SetValue(m.AlphaTest);
+            P["Enhance"].SetValue(new Vector4(s_enhanceTextures ? 0.3f : 0f, 0, 0, 0));
             P["Fog"].SetValue(m.Fog); P["FogMode"].SetValue(m.FogMode); P["FogColor"].SetValue(m.FogColor);
             P["IndMisc"].SetValue(m.IndMisc);
             if (m.IndMisc.Y != 0)
@@ -905,7 +953,7 @@ internal sealed class TurokGame : Game
                 // Guest texel size (indirect stages address in texels), not the upscaled copy target's size.
                 var size = new Vector2(bound.Width, bound.Height);
                 if (b.CopyRefs[t] != 0 && tex != null && _efbCopyGuestSize.TryGetValue(b.CopyRefs[t], out var g)) size = g;
-                _texSize[t] = new Vector4(size.X, size.Y, 0, 0);
+                _texSize[t] = new Vector4(size.X, size.Y, tex is Texture2D t2 ? t2.LevelCount : 1, 0);
             }
             P["TexSize"].SetValue(_texSize);
 
@@ -921,7 +969,11 @@ internal sealed class TurokGame : Game
         var bb = gd.Viewport.Bounds;
         float scale = Math.Min(bb.Width / (float)_target!.Width, bb.Height / (float)_target.Height);
         int w = (int)(_target.Width * scale), h = (int)(_target.Height * scale);
-        _sprites!.Begin(samplerState: SamplerState.LinearClamp);
+        var pp = _presentFx!.Parameters;
+        pp["Brightness"].SetValue(_settings.Brightness);
+        pp["Contrast"].SetValue(_settings.Contrast);
+        pp["Gamma"].SetValue(_settings.Gamma);
+        _sprites!.Begin(samplerState: SamplerState.LinearClamp, effect: _presentFx);
         _sprites.Draw(_target, new Rectangle((bb.Width - w) / 2, (bb.Height - h) / 2, w, h), Color.White);
         _sprites.End();
 

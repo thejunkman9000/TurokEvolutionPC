@@ -16,6 +16,8 @@ internal static class Program
         //                    [--invert-look]   (keep the game's inverted look on the pad's right stick)
         //                    [--speed X]       (game speed, e.g. 2; hold Tab to fast-forward 4x)
         //                    [--show-intro]    (play the logos and intro movie; skipped by default)
+        //                    [--original-textures] (hardware texture filtering: no anisotropic/trilinear upgrade
+        //                                       or distant alpha-test coverage boost)
         string? iso = null;
         var opt = new TurokGame.Options();
         bool showIntro = false;
@@ -28,6 +30,7 @@ internal static class Program
             case "--widescreen": opt = opt with { Widescreen = true }; break;
             case "--invert-look": opt = opt with { InvertLook = true }; break;
             case "--show-intro": showIntro = true; break;
+            case "--original-textures": TurokGame.s_enhanceTextures = false; break;
             case "--speed" when i + 1 < args.Length && float.TryParse(args[i + 1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sp):
                 opt = opt with { Speed = sp }; i++; break;
             case "--level" when i + 1 < args.Length: Environment.SetEnvironmentVariable("TUROK_LEVEL", args[++i]); break;
