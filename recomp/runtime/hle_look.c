@@ -16,6 +16,7 @@
 // actor drives the rendered camera, so cutscenes and other cameras are left alone.
 // How these were found: analysis/NOTES.md ("Mouse look").
 #define WIN32_LEAN_AND_MEAN
+#include <stdio.h>
 #include <windows.h>
 #include <stdlib.h>
 #include <math.h>
@@ -176,6 +177,19 @@ static void apply_mouse_look(void) {
 // GetAxisX(port, id): the input poll reads the C-stick once per game frame.
 void fn_80007734(PPCContext *c) {
     if (c->r[4] == CSTICK_ID && c->r[3] == 0) apply_mouse_look();
+    if (c->r[4] == CSTICK_ID && c->r[3] == 0 && player_view()) {  // debug: TUROK_POSLOG=1 logs the player position; TUROK_TELEPORT=frame:x,y,z[,yaw,pitch] (game frames; F4 captures print these)
+        static unsigned fr; fr++;
+        uint32_t v = player_view();
+        const char *t = getenv("TUROK_TELEPORT");
+        unsigned at; float x, y, z, yaw, pitch;
+        int k = t ? sscanf(t, "%u:%f,%f,%f,%f,%f", &at, &x, &y, &z, &yaw, &pitch) : 0;
+        if (k >= 4 && fr == at) {
+            wr32(v + 0x34, f2u(x)); wr32(v + 0x38, f2u(y)); wr32(v + 0x3C, f2u(z));
+            if (k == 6) { wr32(v + 0xF0, f2u(yaw)); wr32(v + 0x41C, f2u(pitch)); }
+            logf_("[pos] teleported"); }
+        if (getenv("TUROK_POSLOG") && fr % 60 == 0)
+            logf_("[pos] f%u view %08X %.2f %.2f %.2f", fr, v, u2f(rd32(v + 0x34)), u2f(rd32(v + 0x38)), u2f(rd32(v + 0x3C)));
+    }
     orig_80007734(c);
 }
 

@@ -1185,6 +1185,20 @@ internal sealed class TurokGame : Game
         fs.Write(new ReadOnlySpan<byte>(ram, (int)size));
     }
 
+    // Player position and view for bug reports: the view actor *(0x803113AC) holds the
+    // position at +0x34, yaw (radians) at +0xF0 and look pitch (degrees) at +0x41C.
+    // TUROK_TELEPORT (core, hle_look.c) takes the same numbers: frame:x,y,z,yaw,pitch.
+    private static unsafe string PlayerPlace()
+    {
+        byte* ram = Core.Ram(out uint size);
+        uint U(uint a) { byte* q = ram + (a & 0x01FFFFFF); return (uint)(q[0] << 24 | q[1] << 16 | q[2] << 8 | q[3]); }
+        float F(uint a) => BitConverter.UInt32BitsToSingle(U(a));
+        uint v = U(0x803113AC);
+        if (v < 0x80000000 || (v & 0x01FFFFFF) + 0x420 > size) return "player: none";
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+        return string.Format(ci, "player: {0:F2},{1:F2},{2:F2},{3:F4},{4:F2} (x,y,z,yaw,pitch)", F(v + 0x34), F(v + 0x38), F(v + 0x3C), F(v + 0xF0), F(v + 0x41C));
+    }
+
     private static unsafe void PokeAdd(uint addr, float add)
     {
         byte* p = Core.Ram(out _) + (addr & 0x01FFFFFF);
@@ -1205,6 +1219,7 @@ internal sealed class TurokGame : Game
                 using (var fs = File.Create(Path.Combine(dir, $"tex_{id:D5}.png"))) e.Tex.SaveAsPng(fs, e.Tex.Width, e.Tex.Height);
         using var bw = new StreamWriter(Path.Combine(dir, "draws.txt"));
         bw.WriteLine($"frame {_framesReceived}; alpha lighting {(_alphaLightOff ? "off" : "on")}");
+        bw.WriteLine(PlayerPlace());
         for (int i = 0; i < _batches.Count; i++)
         {
             var b = _batches[i];

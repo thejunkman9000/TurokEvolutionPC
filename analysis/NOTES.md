@@ -390,3 +390,15 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
 - The host sets TUROK_NOCULL=1 unless `--cull` is given.
 - Level 1 check: draws go from ~4500 to ~4850 per frame, the frame rate is unchanged at 60, and there are no errors.
 - Not verified at the user's pond spot.
+
+## Pond bushes vanishing up close (open)
+- User's F4 pair (far/near, 107 frames apart): the bush batch (texture with the flowering bush) loses every instance closer than ~17 units; farther ones still draw. The vertex alpha is 255 and the konst is 1.
+- Bush TEV: alpha = texA x c0.a, tested >= 244. Stages 1-2 pass APREV and write REG2, so channel 1 never reaches alpha.
+- The light-7 spot (fn_8010747C: GXInitLightSpot 89.5 flat, GXInitLightDir(M x (0,-1,0)), DistAttn ref 6 / 0.025 steep) feeds only colour channel 1. My lighting matches Dolphin's formulas.
+- Object distance fade (fn_800936BC): opacity = (end - sqrt(d^2/scale^2)) / (end - start), 1 inside start. Logged values fade out correctly with distance (e.g. 15->20, 25->60). fn_800F3D38's sqrt is decoded and correct.
+  - Opacity path: fn_80016030 sets global +0x94, which fn_8010234C copies into the render node +0x1C.
+- So the near bushes are dropped by something else, probably a near LOD swap. A repro at the user's spot is needed.
+- Tools added for that:
+  - F4 captures now print `player: x,y,z,yaw,pitch` (view actor +0x34/+0x38/+0x3C, +0xF0, +0x41C).
+  - `TUROK_TELEPORT=<game frame>:x,y,z[,yaw,pitch]` puts the player there.
+  - `TUROK_POSLOG=1` logs the position every 60 game frames.
