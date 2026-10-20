@@ -40,3 +40,7 @@ GXCopyDisp  # frame end: look stamp for the host's view reprojection
 # Frame timing for the [stats] line (time the guest spends waiting for retrace): runtime/hle.c.
 VIWaitForRetrace
 80106BEC  # per-object opacity setter (F2 experiment): runtime/hle_look.c
+
+# Widescreen: horizontal frustum culling widened to the host's EFB aspect: runtime/hle_frustum.c.
+8000EB88  # camera culling planes
+8000F2A4  # camera view-cone corner rays

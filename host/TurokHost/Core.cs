@@ -140,6 +140,10 @@ internal static unsafe partial class Core
     [LibraryImport(Dll, EntryPoint = "core_get_speed")]
     public static partial float GetSpeed();
 
+    // The world is drawn widen (EFB width / 640) times wider than 4:3: widen the game's culling.
+    [LibraryImport(Dll, EntryPoint = "core_set_aspect")]
+    public static partial void SetAspect(float widen);
+
     // True while mouse look applies (on-foot first-person control).
     [LibraryImport(Dll, EntryPoint = "core_first_person")]
     private static partial int FirstPersonRaw();

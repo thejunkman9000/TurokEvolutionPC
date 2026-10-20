@@ -38,4 +38,5 @@ reference/dolsdk/
 
 # Level sweep captures and logs
 analysis/sweep/
+analysis/widescreen/
 analysis/audio_captures/
