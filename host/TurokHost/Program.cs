@@ -10,7 +10,8 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
-        // TurokEvolution.exe [disc.iso] [--fullscreen] [--scale N] [--no-vsync] [--widescreen]
+        // TurokEvolution.exe [disc.iso] [--fullscreen] [--scale N] [--no-vsync]
+        //                    [--4x3 | --widescreen] (3D view: original 4:3, or fixed 16:9; default follows the window)
         //                    [--level data/levels/<pod>/<name>/<name>.atr]  (New Game starts that level)
         //                    [--mouse-sens X]  (mouse look speed multiplier, default 1)
         //                    [--invert-look]   (keep the game's inverted look on the pad's right stick)
@@ -27,7 +28,8 @@ internal static class Program
             {
             case "--fullscreen": opt = opt with { Fullscreen = true }; break;
             case "--no-vsync": opt = opt with { VSync = false }; break;
-            case "--widescreen": opt = opt with { Widescreen = true }; break;
+            case "--widescreen": opt = opt with { Aspect = TurokGame.AspectMode.Wide16x9 }; break;
+            case "--4x3": opt = opt with { Aspect = TurokGame.AspectMode.Original4x3 }; break;
             case "--invert-look": opt = opt with { InvertLook = true }; break;
             case "--show-intro": showIntro = true; break;
             case "--original-textures": TurokGame.s_enhanceTextures = false; break;

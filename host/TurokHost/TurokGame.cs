@@ -13,12 +13,18 @@ namespace TurokHost;
 internal sealed class TurokGame : Game
 {
     private const int EfbHeight = 480;
-    // EFB width: 640 (4:3), or 854 with --widescreen. In widescreen, full-width perspective
-    // draws are stretched to the wide EFB with a narrower projection (same vertical FOV,
-    // more horizontally); everything else (HUD, 2D, shadow pass) stays 4:3, centered.
-    private readonly int EfbWidth;
-    private readonly float _wideFactor;
-    private readonly int _centerOff;
+    // EFB width follows the window's aspect (480 x aspect, 4:3..32:9; fixed 16:9 with
+    // --widescreen, 640 with --4x3) and is rebuilt when the window is resized. Full-width
+    // perspective draws are stretched to the wide EFB with a narrower projection (same
+    // vertical FOV, more horizontally); everything else (HUD, 2D, shadow pass) stays 4:3,
+    // centered. See "Dynamic widescreen" in analysis/NOTES.md.
+    private const int MaxEfbWidth = 1706;  // 32:9
+    private readonly AspectMode _aspectMode;
+    // TUROK_NARROW_CULL=1 keeps the game's 4:3 frustum culling (to compare).
+    private readonly bool _narrowCulling = Environment.GetEnvironmentVariable("TUROK_NARROW_CULL") == "1";
+    private int EfbWidth = 640;
+    private float _wideFactor = 1f;
+    private int _centerOff;
     private readonly int RenderScale;  // internal resolution = 640x480 * RenderScale
 
     private readonly GraphicsDeviceManager _graphics;
@@ -33,6 +39,7 @@ internal sealed class TurokGame : Game
     private readonly Dictionary<uint, RenderTarget2D> _efbCopies = new();
     // Guest (EFB texel) size of each copy: the render targets are upscaled and, in widescreen, widened.
     private readonly Dictionary<uint, Vector2> _efbCopyGuestSize = new();
+    private readonly Dictionary<uint, bool> _efbCopyWide = new();  // copied from the full width of a wide EFB
     private readonly Vector4[] _texSize = new Vector4[8];
 
     // Last frame copied out of the core (redrawn until a newer one arrives).
@@ -95,6 +102,7 @@ internal sealed class TurokGame : Game
     private bool _screenshotPending;
     private readonly List<(int Frame, PadButtons Button, int Hold)> _script = new();
     private readonly List<(int Frame, string Axis, int Hold)> _stickScript = new();
+    private readonly List<(int Frame, int W, int H)> _windowScript = new();
 
     private sealed class Batch
     {
@@ -111,6 +119,11 @@ internal sealed class TurokGame : Game
         public Vector2 CopyGuestSize;
         public float ClearDepth;
         public readonly uint[] CopyRefs = new uint[8];  // EFB copy ids referenced per tex map (0 = none)
+        // As the core sent them (640x480 EFB space); RemapBatches turns them into the fields
+        // above for the current EFB width, again whenever the window changes shape.
+        public Matrix GuestProjection;
+        public bool Perspective, FullQuad;
+        public readonly int[] GuestViewport = new int[4], GuestScissor = new int[4], GuestCopySrc = new int[4];
     }
 
     // A CoreMaterial converted to effect parameter arrays and state objects.
@@ -128,7 +141,9 @@ internal sealed class TurokGame : Game
         public uint Cull;
     }
 
-    public sealed record Options(int Scale = 2, bool Fullscreen = false, bool VSync = true, bool Widescreen = false,
+    public enum AspectMode { Window, Wide16x9, Original4x3 }
+
+    public sealed record Options(int Scale = 2, bool Fullscreen = false, bool VSync = true, AspectMode Aspect = AspectMode.Window,
                                  float MouseSensitivity = 1f, bool InvertLook = false, float Speed = 1f);
 
     public TurokGame(string isoPath, Options? options = null)
@@ -139,13 +154,11 @@ internal sealed class TurokGame : Game
         _baseSpeed = Math.Clamp(options.Speed, 0.25f, 8f);
         _isoPath = isoPath;
         RenderScale = Math.Clamp(options.Scale, 1, 4);
-        EfbWidth = options.Widescreen ? 854 : 640;
-        _wideFactor = EfbWidth / 640f;
-        _centerOff = (EfbWidth - 640) / 2;
+        _aspectMode = options.Aspect;
         _graphics = new GraphicsDeviceManager(this)
         {
-            PreferredBackBufferWidth = options.Widescreen ? 1280 : 1280,
-            PreferredBackBufferHeight = options.Widescreen ? 720 : 960,
+            PreferredBackBufferWidth = 1280,
+            PreferredBackBufferHeight = options.Aspect == AspectMode.Original4x3 ? 960 : 720,
             SynchronizeWithVerticalRetrace = options.VSync,
             HardwareModeSwitch = false,  // borderless fullscreen
             IsFullScreen = options.Fullscreen,
@@ -153,6 +166,17 @@ internal sealed class TurokGame : Game
         };
         IsMouseVisible = true;
         Window.AllowUserResizing = true;
+        // Keep the back buffer at the window's client size, so the EFB (UpdateEfbSize) can
+        // follow the window's shape live while it is dragged.
+        Window.ClientSizeChanged += (_, _) =>
+        {
+            var cb = Window.ClientBounds;
+            if (_graphics.IsFullScreen || cb.Width <= 0 || cb.Height <= 0) return;
+            if (cb.Width == _graphics.PreferredBackBufferWidth && cb.Height == _graphics.PreferredBackBufferHeight) return;
+            _graphics.PreferredBackBufferWidth = cb.Width;
+            _graphics.PreferredBackBufferHeight = cb.Height;
+            _graphics.ApplyChanges();
+        };
         // Run one update+draw per display refresh (vsync), not MonoGame's fixed 60 Hz
         // step, which drifts against the display and drops/doubles frames.
         IsFixedTimeStep = false;
@@ -171,6 +195,19 @@ internal sealed class TurokGame : Game
             if (f.Length == 3 && int.TryParse(f[0], out var pf) && uint.TryParse(f[1], System.Globalization.NumberStyles.HexNumber, null, out var pa) &&
                 float.TryParse(f[2], System.Globalization.CultureInfo.InvariantCulture, out var pd))
                 _pokes.Add((pf, pa, pd));
+        }
+        // TUROK_WINDOW=WxH[@frame],...: window client size at startup (no frame) or from that
+        // frame on (testing the aspect-following EFB), e.g. "1280x720,1680x720@3000";
+        // "full@frame" toggles fullscreen like F11.
+        foreach (var part in (Environment.GetEnvironmentVariable("TUROK_WINDOW") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var f = part.Split('@');
+            var wh = f[0].Split('x');
+            if (f[0] == "full" && f.Length > 1 && int.TryParse(f[1], out var ff)) { _windowScript.Add((ff, 0, 0)); continue; }
+            if (wh.Length != 2 || !int.TryParse(wh[0], out var ww) || !int.TryParse(wh[1], out var wh2)) continue;
+            int at = f.Length > 1 && int.TryParse(f[1], out var wf) ? wf : -1;
+            if (at < 0) { _graphics.PreferredBackBufferWidth = ww; _graphics.PreferredBackBufferHeight = wh2; }
+            else _windowScript.Add((at, ww, wh2));
         }
         // TUROK_INPUT=frame:Button[:holdFrames],...  e.g. "150:Down:4,200:A:6".
         // Sticks: LX+ LX- LY+ LY- (main) and CX+ CX- CY+ CY- (C-stick) at full deflection.
@@ -197,9 +234,7 @@ internal sealed class TurokGame : Game
 
     protected override void LoadContent()
     {
-        // PreserveContents: the EFB is unbound mid-frame for EFB-to-texture copies.
-        _target = new RenderTarget2D(GraphicsDevice, EfbWidth * RenderScale, EfbHeight * RenderScale, false,
-                                     SurfaceFormat.Color, DepthFormat.Depth24Stencil8, 0, RenderTargetUsage.PreserveContents);
+        UpdateEfbSize();
         _sprites = new SpriteBatch(GraphicsDevice);
         using (var s = typeof(TurokGame).Assembly.GetManifestResourceStream("Tev.mgfxo")!)
         using (var ms = new MemoryStream())
@@ -435,6 +470,15 @@ internal sealed class TurokGame : Game
         Core.SetPad(0, (ushort)b, Axis(lx), Axis(ly), Axis(cx), Axis(cy),
                     (byte)(lt * 255), (byte)(rt * 255));
 
+        for (int i = _windowScript.Count - 1; i >= 0; i--)
+        {
+            if (_framesReceived < _windowScript[i].Frame) continue;
+            if (_windowScript[i].W == 0) { _graphics.ToggleFullScreen(); _windowScript.RemoveAt(i); continue; }
+            _graphics.PreferredBackBufferWidth = _windowScript[i].W;
+            _graphics.PreferredBackBufferHeight = _windowScript[i].H;
+            _graphics.ApplyChanges();
+            _windowScript.RemoveAt(i);
+        }
         PumpAudio();
 
         var st = Core.State(out var msg);
@@ -538,15 +582,17 @@ internal sealed class TurokGame : Game
                 var b = _batches[i];
                 float* m = cb->Proj;
                 // Core matrices are row-major for column vectors; MonoGame uses row vectors.
-                b.Projection = new Matrix(m[0], m[4], m[8], m[12],
+                b.GuestProjection = new Matrix(m[0], m[4], m[8], m[12],
                                           m[1], m[5], m[9], m[13],
                                           m[2], m[6], m[10], m[14],
                                           m[3], m[7], m[11], m[15]);
                 b.First = (int)cb->FirstVertex; b.Count = (int)cb->VertexCount;
                 b.Material = (int)cb->Material;
                 b.Kind = cb->Kind; b.CopyId = cb->CopyId; b.CopyMode = cb->CopyMode;
-                bool wideCopy = _centerOff != 0 && cb->CopySrc[0] <= 0 && cb->CopySrc[2] >= 600;
-                b.CopySrc = new Rectangle(MapX(cb->CopySrc[0], wideCopy), cb->CopySrc[1], MapW(cb->CopySrc[2], wideCopy), cb->CopySrc[3]);
+                for (int k = 0; k < 4; k++)
+                {
+                    b.GuestViewport[k] = cb->Viewport[k]; b.GuestScissor[k] = cb->Scissor[k]; b.GuestCopySrc[k] = cb->CopySrc[k];
+                }
                 b.ClearColor = cb->ClearColor; b.ClearDepth = cb->ClearDepth;
                 b.CopyGuestSize = (cb->CopyMode & 0x100) != 0
                     ? new Vector2(Math.Max(1, (int)cb->CopySrc[2] / 2), Math.Max(1, (int)cb->CopySrc[3] / 2))
@@ -559,6 +605,8 @@ internal sealed class TurokGame : Game
                     b.Samplers[t] = Sampler(cb->Sampler[t]);
                 }
                 bool perspective = m[15] == 0f;
+                b.Perspective = perspective;
+                b.FullQuad = !perspective && cb->Kind == 0 && IsFullScreenQuad(f, cb, b.GuestProjection);
                 // World draws only: the first-person weapon is drawn in view space right in
                 // front of the camera (|z| < 0.6) and must stay attached to it.
                 b.Reproject = perspective && cb->Viewport[2] >= 600 && cb->Viewport[3] >= 400;
@@ -574,29 +622,109 @@ internal sealed class TurokGame : Game
                     float zmin = float.MaxValue, zmax = float.MinValue;
                     for (int v = 0; v < cb->VertexCount; v++) { float z = f->Vertices[cb->FirstVertex + v].Position.Z; zmin = Math.Min(zmin, z); zmax = Math.Max(zmax, z); }
                     _batchInfo ??= new System.Text.StringBuilder();
-                    _batchInfo.AppendLine($"{i} kind {cb->Kind} n {cb->VertexCount} persp {perspective} P11 {m[0]:F3} P22 {m[5]:F3} P33 {m[10]:F5} P34 {m[11]:F3} vp {cb->Viewport[0]},{cb->Viewport[1]},{cb->Viewport[2]},{cb->Viewport[3]} z {zmin:F2}..{zmax:F2}");
+                    _batchInfo.AppendLine($"{i} kind {cb->Kind} n {cb->VertexCount} persp {perspective} P11 {m[0]:F3} P22 {m[5]:F3} P33 {m[10]:F5} P34 {m[11]:F3} vp {cb->Viewport[0]},{cb->Viewport[1]},{cb->Viewport[2]},{cb->Viewport[3]} z {zmin:F2}..{zmax:F2} fullquad {b.FullQuad} tex [{string.Join(",", b.TextureIds)}] copies [{string.Join(",", b.CopyRefs)}] mat {cb->Material}" +
+                                          (cb->Kind == 1 ? $" copy id {cb->CopyId} src {cb->CopySrc[0]},{cb->CopySrc[1]},{cb->CopySrc[2]},{cb->CopySrc[3]} mode {cb->CopyMode:X}" : ""));
                 }
-                bool widen = _centerOff != 0 && perspective && cb->Viewport[0] <= 16 && cb->Viewport[2] >= 600;
-                if (widen)
-                {
-                    // narrower x projection so the wider viewport isn't stretched
-                    float k = 1f / _wideFactor;
-                    b.Projection.M11 *= k; b.Projection.M21 *= k; b.Projection.M31 *= k; b.Projection.M41 *= k;
-                }
-                b.Viewport = new Rectangle(MapX(cb->Viewport[0], widen) * RenderScale, cb->Viewport[1] * RenderScale,
-                                           MapW(cb->Viewport[2], widen) * RenderScale, cb->Viewport[3] * RenderScale);
-                bool fullScissor = cb->Scissor[0] <= 0 && cb->Scissor[2] >= 640;
-                int sx0 = widen && fullScissor ? 0 : MapX(cb->Scissor[0], widen);
-                int sx1 = widen && fullScissor ? EfbWidth : MapX(cb->Scissor[2], widen);
-                b.Scissor = new Rectangle(sx0 * RenderScale, cb->Scissor[1] * RenderScale,
-                                          (sx1 - sx0) * RenderScale, (cb->Scissor[3] - cb->Scissor[1]) * RenderScale);
             }
         }
         finally
         {
             Core.ReleaseFrame();
         }
+        RemapBatches();
         PurgeTextures();
+    }
+
+    // An orthographic draw of a few vertices spanning the whole 640-wide screen: a fade,
+    // flash or tint over the 3D view, or a cutscene's letterbox bar, stretched across the
+    // wide EFB so the sides get it too.
+    private static unsafe bool IsFullScreenQuad(CoreFrame* f, CoreBatch* cb, Matrix proj)
+    {
+        if (cb->VertexCount == 0 || cb->VertexCount > 12 || cb->Viewport[0] > 16 || cb->Viewport[2] < 600 || cb->Viewport[3] < 400)
+            return false;
+        float x0 = float.MaxValue, x1 = float.MinValue, y0 = float.MaxValue, y1 = float.MinValue;
+        TevVertex* v = f->Vertices + cb->FirstVertex;
+        for (int i = 0; i < cb->VertexCount; i++)
+        {
+            var p = Vector4.Transform(new Vector4(v[i].Position, 1), proj);
+            x0 = Math.Min(x0, p.X); x1 = Math.Max(x1, p.X); y0 = Math.Min(y0, p.Y); y1 = Math.Max(y1, p.Y);
+        }
+        return x0 <= -0.98f && x1 >= 0.98f && y1 - y0 > 0.02f;
+    }
+
+    // Guest (640-wide) batch rectangles and projections -> the current EFB.
+    private void RemapBatches()
+    {
+        foreach (var b in _batches)
+        {
+            int[] vp = b.GuestViewport, sc = b.GuestScissor, cs = b.GuestCopySrc;
+            bool wideCopy = _centerOff != 0 && cs[0] <= 0 && cs[2] >= 600;
+            b.CopySrc = new Rectangle(MapX(cs[0], wideCopy), cs[1], MapW(cs[2], wideCopy), cs[3]);
+            if (b.Kind != 0) { _efbCopyWide[b.CopyId] = wideCopy; continue; }  // copies precede their use
+            bool fullView = vp[0] <= 16 && vp[2] >= 600;
+            // Perspective: wider view, same vertical FOV. Full-width quads: stretched, but only
+            // fills (untextured, or a tiny texture such as the 8x8 black of the cutscene bars)
+            // and ones sampling a full-width EFB copy (which is itself wide); full-screen
+            // images (menus, FMV) and the HUD stay 4:3.
+            bool stretch = !b.Perspective && b.FullQuad && IsFillOrWideCopy(b);
+            bool widen = _centerOff != 0 && fullView && (b.Perspective || stretch);
+            b.Projection = b.GuestProjection;
+            if (widen && b.Perspective)
+            {
+                // narrower x projection so the wider viewport isn't stretched
+                float k = 1f / _wideFactor;
+                b.Projection.M11 *= k; b.Projection.M21 *= k; b.Projection.M31 *= k; b.Projection.M41 *= k;
+            }
+            b.Viewport = new Rectangle(MapX(vp[0], widen) * RenderScale, vp[1] * RenderScale,
+                                       MapW(vp[2], widen) * RenderScale, vp[3] * RenderScale);
+            bool fullScissor = sc[0] <= 0 && sc[2] >= 640;
+            int sx0 = widen && fullScissor ? 0 : MapX(sc[0], widen);
+            int sx1 = widen && fullScissor ? EfbWidth : MapX(sc[2], widen);
+            b.Scissor = new Rectangle(sx0 * RenderScale, sc[1] * RenderScale,
+                                      (sx1 - sx0) * RenderScale, (sc[3] - sc[1]) * RenderScale);
+        }
+    }
+
+    // True if every texture the batch's TEV stages read is tiny (a fill) or an EFB copy of
+    // the full wide EFB.
+    private bool IsFillOrWideCopy(Batch b)
+    {
+        if (b.Material >= _materials.Count) return false;
+        var m = _materials[b.Material];
+        int stages = (int)m.Misc.Y;
+        for (int s = 0; s < stages && s < 16; s++)
+        {
+            int map = (int)m.Stage[s].X;
+            if (map < 0 || map > 7) continue;
+            if (b.CopyRefs[map] == 0)
+            {
+                if (b.Textures[map] is { Width: <= 16, Height: <= 16 }) continue;
+                return false;  // an image
+            }
+            if (!_efbCopyWide.TryGetValue(b.CopyRefs[map], out bool wide) || !wide) return false;
+        }
+        return true;
+    }
+
+    // EFB width for the back buffer's shape; rebuilds the EFB (and remaps the shown frame)
+    // when it changes, e.g. on a window resize or fullscreen toggle.
+    private void UpdateEfbSize()
+    {
+        var pp = GraphicsDevice.PresentationParameters;
+        int width = 640;
+        if (_aspectMode == AspectMode.Wide16x9) width = 854;
+        else if (_aspectMode == AspectMode.Window && pp.BackBufferWidth > 0 && pp.BackBufferHeight > 0)
+            width = Math.Clamp((int)MathF.Round(EfbHeight * pp.BackBufferWidth / (float)pp.BackBufferHeight / 2) * 2, 640, MaxEfbWidth);
+        if (_target != null && width == EfbWidth) return;
+        EfbWidth = width;
+        _wideFactor = EfbWidth / 640f;
+        _centerOff = (EfbWidth - 640) / 2;
+        _target?.Dispose();
+        // PreserveContents: the EFB is unbound mid-frame for EFB-to-texture copies.
+        _target = new RenderTarget2D(GraphicsDevice, EfbWidth * RenderScale, EfbHeight * RenderScale, false,
+                                     SurfaceFormat.Color, DepthFormat.Depth24Stencil8, 0, RenderTargetUsage.PreserveContents);
+        if (!_narrowCulling) Core.SetAspect(_wideFactor);
+        RemapBatches();
     }
 
     private static unsafe void Copy(float* src, Vector4[] dst)
@@ -921,6 +1049,7 @@ internal sealed class TurokGame : Game
 
     private void DrawFrame()
     {
+        UpdateEfbSize();
         PullFrame();
         UpdateViewRotation();
         var gd = GraphicsDevice;
@@ -979,7 +1108,8 @@ internal sealed class TurokGame : Game
         gd.SetRenderTarget(null);
         gd.Viewport = new Viewport(0, 0, gd.PresentationParameters.BackBufferWidth, gd.PresentationParameters.BackBufferHeight);
         gd.Clear(Color.Black);
-        // Letterbox the 4:3 EFB into the window.
+        // Fit the EFB into the window (it already has the window's shape unless the window is
+        // narrower than 4:3 or wider than 32:9, or the aspect is fixed).
         var bb = gd.Viewport.Bounds;
         float scale = Math.Min(bb.Width / (float)_target!.Width, bb.Height / (float)_target.Height);
         int w = (int)(_target.Width * scale), h = (int)(_target.Height * scale);

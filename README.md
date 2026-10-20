@@ -31,8 +31,10 @@ The first build takes a few minutes (about 600,000 recompiled instructions are c
 host\TurokHost\bin\Release\net9.0-windows\TurokEvolution.exe "D:\Games\Turok - Evolution NTSC-U.iso"
 ```
 
-Options: `--fullscreen`, `--scale 1..4` (internal resolution, multiples of 640x480; default 2),
-`--widescreen` (16:9: the 3D view gets wider, HUD and menus stay 4:3), `--no-vsync`. If the `.iso` sits next to the executable (or a few folders above it) the path can be omitted.
+Options: `--fullscreen`, `--scale 1..4` (internal resolution, multiples of 640x480; default 2), `--no-vsync`.
+The 3D view takes the window's shape (4:3 up to 32:9) and follows it live as the window is resized or goes
+fullscreen; the HUD, menus and movies stay 4:3, centered. `--4x3` keeps the original 4:3 picture and
+`--widescreen` fixes the view at 16:9 whatever the window. If the `.iso` sits next to the executable (or a few folders above it) the path can be omitted.
 
 Level select: `--level data/levels/<pod>/<name>/<name>.atr` makes **New Game** start that level instead of the
 first jungle level, e.g. `--level data/levels/pod-07-dark-jungle/darkjungle_1/darkjungle_1.atr`.

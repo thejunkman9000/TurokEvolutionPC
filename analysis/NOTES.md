@@ -188,8 +188,8 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - Indirect stages are sampled at shifted coordinates, then each stage's format, bias and bump alpha are applied, followed by the static or S/T-dynamic matrices and the wrap/add-previous steps, with s24 wrap.
   - Stages sample with explicit gradients. Setup-unit texcoord sizes come from BP 0x30+.
   - Used by about 25 draws per frame in level 1 (the river by the bridge). `TUROK_DEBUG_VIEW=5` shows indirect draws in magenta.
-- **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--widescreen] [--no-vsync] [--level <atr path>]`. F11 or Alt+Enter toggles borderless fullscreen.
-- **Widescreen:** the EFB is 854 wide. Perspective draws whose viewport spans the full 640 width are stretched across it, with the projection's X row scaled by 640/854. Every other draw, and any EFB copy narrower than full width (such as the shadow map), stays 4:3 and is shifted to the center.
+- **Host options:** `TurokEvolution.exe [iso] [--fullscreen] [--scale 1-4] [--4x3 | --widescreen] [--no-vsync] [--level <atr path>]`. F11 or Alt+Enter toggles borderless fullscreen.
+- **Widescreen** (superseded by "Dynamic widescreen" below; `--widescreen` still gives this fixed 16:9): the EFB is 854 wide. Perspective draws whose viewport spans the full 640 width are stretched across it, with the projection's X row scaled by 640/854. Every other draw, and any EFB copy narrower than full width (such as the shadow map), stays 4:3 and is shifted to the center.
 - **Mouse look:** click inside the window to capture the mouse, Esc to release. Motion turns the view directly through `core_mouse_look` (yaw and pitch are written on the player's view actor), not through the C-stick. Left/right buttons map to R/L. `--mouse-sens X` scales it (0.0022 rad/pixel at 1).
   - The game's own stick turning is unusable for a mouse. Measured by overriding the value GetAxisX returns:
     - Yaw: dead zone up to 0.3 normalized. 0.5 → 0.0075, 0.75 → 0.020, 1.0 → 0.052 rad/frame (≈180°/s max). 2 frames of latency, then a ~5-frame ramp.
@@ -333,3 +333,27 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - A walking script couldn't reach it.
   - One light-driven alpha setup exists: light 7, spot attenuation, at the camera, cos (-8.73, 1000, 0), dist (1, 0, 1.083), dir view-up. My attenuation matches Dolphin's formulas.
   - Debug keys added: F3 toggles light-driven alpha (`core_debug_toggle(1)` / `TUROK_NOALPHALIGHT=1`). F4 (or `TUROK_CAPTURE=<frame>`) writes `captures\<time>\` with screen.png, the frame's textures, and draws.txt (per draw: z range, vertex alpha ranges, alpha test, blend, stage-0 alpha inputs, depth), plus a GX dump in the log. `TUROK_LIGHTLOG=1` logs light-driven alpha setups.
+
+## Dynamic widescreen
+
+- **Default:** the 3D world takes the window's shape. The EFB is `480 x aspect` guest pixels wide (even, clamped to 640..1706, i.e. 4:3..32:9) times `--scale`. `UpdateEfbSize` (TurokGame.cs) checks the back buffer every draw and rebuilds the EFB when the width changes, so window drags, `TUROK_WINDOW` resizes and F11 all apply on the next present. A `Window.ClientSizeChanged` handler keeps the back buffer at the client size. Outside 4:3..32:9 the EFB is fitted into the window with bars. `--4x3` gives 640; `--widescreen` gives a fixed 854 (16:9).
+- **Remapping:** each batch keeps its guest (640x480) viewport, scissor, copy rectangle and projection. `RemapBatches` maps them to the current EFB after every new frame and after every EFB rebuild, so the frame on screen is right immediately after a resize.
+  - Full-width perspective draws are stretched, with the projection's X row scaled by 640/EFB width. Pixel offsets from the centre are unchanged, so menu 3D models still line up with the 4:3 UI. The first-person weapon is one of these draws and is widened without distortion.
+  - Everything else (HUD, 2D, the 240x240 foliage/shadow pass and its copy) stays 4:3, centred. EFB copies of the full width are copied wide; narrower ones are offset to the centre.
+  - Orthographic draws of at most 12 vertices that span the full 640 width are stretched too, if every texture they sample is a "fill" (16x16 or smaller) or a full-width EFB copy. This covers fades, flashes and the cutscene letterbox bars, which are 12 vertices with an 8x8 black texture. Without it the bars covered only the 4:3 centre. Full-screen images (menus, FMV) are bigger textures and stay 4:3 with black sides.
+  - Indirect texturing: copies keep a 640-wide guest size. The shader builds texel coordinates from the game's coord size (BP 0x30, also 640) and divides by `TexSize`, so the base mapping stays right. Distortion offsets come out up to `EFB width/640` times wider on screen. Dark Jungle's full-screen distortion pass covers the whole width with no seam.
+  - View reprojection (`UpdateViewRotation`) multiplies its rotation in before the widened projection, so it carries over as is. It was not re-tested with a real mouse.
+  - Screenshots (F12, `TUROK_SCREENSHOT`) save the whole wide EFB.
+- **Frustum culling** (`recomp/runtime/hle_frustum.c`). `fn_80105BEC` is not culling: it builds an inverse view rotation (billboards). The culling volume comes from the camera object (the active one is at 0x802CC3B8):
+  - The camera holds the viewport at +0xD8..+0xE4, pixel aspect at +0xE8 and hfov at +0xEC. vfov is derived from these by `fn_80010C30`.
+  - It caches cot(hfov/2) at +0x108 and cot(vfov/2) at +0x10C, recomputed when flag 0x2 of +0x1A8 is set.
+  - `fn_8000EB88` builds the side, top, bottom, near and far planes at +0x144..+0x1A0, cached under flag 0x10 with the space key at +0x1A4. They are used by the per-object test `fn_8000F8E8`: an inline fast accept, then a plane test.
+  - `fn_8000F2A4` builds the four corner rays at +0x110..+0x134 (flag 0x20, key at +0x140). The scene (`fn_80107794`) turns them into its world-culling cone.
+  - Both builders are wrapped to call the original with +0x108 divided by the host's factor (`core_set_aspect`, EFB width/640) and restore it afterwards. They force a rebuild when the factor changes for that camera.
+  - The render projection (`fn_80004F20` uses +0xEC) and the world-to-screen mapping (`fn_8000E9DC`) are untouched. The fast accept stays 4:3, so edge objects fall through to the widened planes.
+  - Check: `TUROK_CULL_SCALE=0.5` visibly removes foliage at the sides. At 32:9 with `TUROK_NARROW_CULL=1` (host passes no factor), the flowering bushes at the right edge are missing; with the default they are drawn. At 16:9/21:9 the game's bounding volumes are loose enough that little is lost either way.
+- **Testing:** `TUROK_WINDOW=WxH[@frame],...` sets the window client size at start or at a frame; `full@frame` toggles fullscreen. Verified, with screenshots in `analysis/widescreen/` (not committed):
+  - Level 1 at 16:9, 21:9, 32:9 and 1000x700 after a live resize.
+  - An OS `SetWindowPos` resize to 1484x521 mid-game.
+  - A 4:3 window toggled to fullscreen on a 2560x1440 monitor (EFB 854).
+  - `--4x3` (EFB 640), the title, menus, FMV, the level-1 intro cutscene and Dark Jungle.
