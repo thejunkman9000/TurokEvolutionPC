@@ -63,6 +63,7 @@ Click in the window to capture the mouse; the mouse turns the view directly, lik
 | Brightness down / up | F5 / F6 | |
 | Contrast down / up | F7 / F8 | |
 | Gamma down / up | F9 / F10 | |
+| Debug: force object fades opaque (experiment) | F2 | |
 | Debug: toggle light-driven alpha fades | F3 | |
 | Debug: save a capture of this frame (`captures\`) | F4 | |
 

@@ -178,3 +178,15 @@ void fn_80007734(PPCContext *c) {
     if (c->r[4] == CSTICK_ID && c->r[3] == 0) apply_mouse_look();
     orig_80007734(c);
 }
+
+
+// Per-object opacity (cross-fade) setter: fn_80106BEC(r3 = renderer, r4 = material
+// slot, f1 = opacity 0..1). It sets the konst alpha (opacity * 255) and the alpha
+// test reference (opacity * 244) used by blended foliage. Debug/experiment: with
+// fades forced (TUROK_NOFADE=1 or core_debug_toggle(2), host F2) everything draws opaque.
+volatile int g_no_fade = -1;
+void fn_80106BEC(PPCContext *c) {
+    if (g_no_fade < 0) g_no_fade = getenv("TUROK_NOFADE") != NULL;
+    if (g_no_fade > 0) c->f[1] = 1.0;
+    orig_80106BEC(c);
+}

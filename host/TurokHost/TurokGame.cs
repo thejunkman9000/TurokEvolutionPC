@@ -69,6 +69,7 @@ internal sealed class TurokGame : Game
     private bool _mouseCaptured;
     private bool _escHeld;
     private bool _f3Held, _f4Held, _alphaLightOff, _captureNext;
+    private bool _f2Held, _fadesOff;
     private int _captureFrame = -1;
     private Effect? _presentFx;
     private readonly Settings _settings = Settings.Load();
@@ -285,7 +286,15 @@ internal sealed class TurokGame : Game
         if (kb.IsKeyDown(Keys.F12)) _screenshotPending = true;
         // Debug: F3 toggles light-driven alpha (distance fades); F4 saves a capture of the
         // next frame (screenshot, textures, per-draw details, GX command log).
-        bool f3 = kb.IsKeyDown(Keys.F3), f4 = kb.IsKeyDown(Keys.F4);
+        bool f2 = kb.IsKeyDown(Keys.F2), f3 = kb.IsKeyDown(Keys.F3), f4 = kb.IsKeyDown(Keys.F4);
+        if (f2 && !_f2Held && IsActive)
+        {
+            Core.DebugToggle(2);
+            _fadesOff = !_fadesOff;
+            _pictureMessage = _fadesOff ? "debug: object fades forced opaque (F2)" : "debug: object fades on (F2)";
+            _pictureMessageUntil = Environment.TickCount64 + 3000;
+        }
+        _f2Held = f2;
         if (f3 && !_f3Held && IsActive)
         {
             Core.DebugToggle(1);

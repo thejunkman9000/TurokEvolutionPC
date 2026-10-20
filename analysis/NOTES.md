@@ -333,3 +333,13 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - A walking script couldn't reach it.
   - One light-driven alpha setup exists: light 7, spot attenuation, at the camera, cos (-8.73, 1000, 0), dist (1, 0, 1.083), dir view-up. My attenuation matches Dolphin's formulas.
   - Debug keys added: F3 toggles light-driven alpha (`core_debug_toggle(1)` / `TUROK_NOALPHALIGHT=1`). F4 (or `TUROK_CAPTURE=<frame>`) writes `captures\<time>\` with screen.png, the frame's textures, and draws.txt (per draw: z range, vertex alpha ranges, alpha test, blend, stage-0 alpha inputs, depth), plus a GX dump in the log. `TUROK_LIGHTLOG=1` logs light-driven alpha setups.
+
+### Vanishing bushes: what the user's F4 capture showed
+- The bushes are blended (SRCALPHA/INVSRCALPHA), alpha-tested foliage drawn through `fn_80106BEC(r3 renderer, r4 slot, f1 opacity)`.
+  - The konst alpha K2.r is set to opacity × 255, and the alpha reference to opacity × 244 (GEQUAL), AND LEQUAL 255.
+  - TEV alpha = texA × rasA × K, where rasA is the light-7 distance alpha (F3 removes it).
+  - The textures are clean cut-outs (alpha 0/255), and RGB5A3 and konst decoding are correct.
+- The opacities come from the renderer's draw-list nodes (+0x1C), via `fn_80105F60`, called from `fn_80105E20`, called from `fn_8001BD48`.
+  - They are stable frame to frame while standing still and change as the player moves: a distance cross-fade, with near nodes dropping to 0.02–0.07.
+  - The code that computes them hasn't been found yet. (`fn_8001BD48`'s +0x14/+0x1C writes are a matrix inverse.)
+- Experiment: F2 (`core_debug_toggle(2)`, `TUROK_NOFADE=1`) forces every opacity to 1. If bushes stop vanishing with it, the fade value is the culprit (or the intended original behaviour).

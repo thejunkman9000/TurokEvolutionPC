@@ -544,8 +544,9 @@ int g_light_log = -1;
 // core_debug_toggle(1) (host F3).
 volatile int g_no_alpha_light = -1;
 CORE_API void core_debug_toggle(int which) {
-    if (which == 1) g_no_alpha_light = g_no_alpha_light > 0 ? 0 : 1;
-    logf_("[debug] alpha lighting %s", g_no_alpha_light > 0 ? "off" : "on");
+    extern volatile int g_no_fade;
+    if (which == 1) { g_no_alpha_light = g_no_alpha_light > 0 ? 0 : 1; logf_("[debug] alpha lighting %s", g_no_alpha_light > 0 ? "off" : "on"); }
+    if (which == 2) { g_no_fade = g_no_fade > 0 ? 0 : 1; logf_("[debug] object fades %s", g_no_fade > 0 ? "forced opaque" : "on"); }
 }
 static void light_log(const XfSnap *x, uint32_t ctl, const float pos[3], float a, float mat) {
     static uint32_t seen[64]; static int nseen;
