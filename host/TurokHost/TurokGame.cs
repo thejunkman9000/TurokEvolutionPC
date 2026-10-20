@@ -75,6 +75,12 @@ internal sealed class TurokGame : Game
     // Mouse look: click in the window to capture the mouse, Esc to release.
     private bool _mouseCaptured;
     private bool _escHeld;
+    // Audio diagnostics: trims/starves with frame numbers (host_stats.txt); TUROK_HOST_WAV=<path>
+    // records exactly what is submitted to the sound device.
+    private int _audioTrims;
+    private readonly List<string> _audioEvents = new();
+    private readonly FileStream? _hostWav =
+        Environment.GetEnvironmentVariable("TUROK_HOST_WAV") is { Length: > 0 } wp ? File.Create(wp) : null;
     private bool _f3Held, _f4Held, _alphaLightOff, _captureNext;
     private bool _f2Held, _fadesOff;
     private int _captureFrame = -1;
@@ -533,6 +539,7 @@ internal sealed class TurokGame : Game
         if (_speed != 1f) _audioQueue.Clear();
         // If we fell behind (clock drift, a stall), drop the oldest audio to keep latency low.
         int maxSamples = rate / 4 * 2;  // 250 ms of stereo samples
+        if (_audioQueue.Count > maxSamples) { _audioTrims++; _audioEvents.Add($"frame {_framesReceived}: trimmed {(_audioQueue.Count - maxSamples) / 2} frames"); }
         while (_audioQueue.Count > maxSamples) { _audioQueue.Dequeue(); _audioQueue.Dequeue(); }
 
         while (_sound.PendingBufferCount < 3 && _audioQueue.Count >= AudioChunkFrames * 2)
@@ -544,16 +551,23 @@ internal sealed class TurokGame : Game
                 bytes[2 * i] = (byte)v; bytes[2 * i + 1] = (byte)(v >> 8);
             }
             _sound.SubmitBuffer(bytes);
+            _hostWav?.Write(bytes);
             _audioSubmitted++;
         }
-        if (_audioSubmitted > 100 && _sound.PendingBufferCount == 0) _audioStarved++;  // steady state only
+        if (_audioSubmitted > 100 && _sound.PendingBufferCount == 0)  // steady state only
+        {
+            _audioStarved++;
+            _audioEvents.Add($"frame {_framesReceived}: starved (queue {_audioQueue.Count / 2} frames)");
+        }
     }
 
     protected override void OnExiting(object sender, ExitingEventArgs args)
     {
         File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "host_stats.txt"),
             $"audio: rate {_soundRate} submitted {_audioSubmitted} buffers ({_audioSubmitted * AudioChunkFrames / (double)Math.Max(1, _soundRate):F1} s), starved updates {_audioStarved}\n" +
-            $"draw: {_drawCount} calls, avg {_drawMsTotal / Math.Max(1, _drawCount):F2} ms, max {_drawMsMax:F1} ms; game frames received {_framesReceived}, repeated presents {_framesRepeated}, skipped {_framesSkipped}; refresh {_refreshMs:F2} ms\n");
+            $"draw: {_drawCount} calls, avg {_drawMsTotal / Math.Max(1, _drawCount):F2} ms, max {_drawMsMax:F1} ms; game frames received {_framesReceived}, repeated presents {_framesRepeated}, skipped {_framesSkipped}; refresh {_refreshMs:F2} ms\n" +
+            $"audio trims {_audioTrims}\n" + string.Join("\n", _audioEvents.Count > 200 ? _audioEvents.GetRange(0, 200) : _audioEvents) + "\n");
+        if (_hostWav != null) WriteWavHeaderAndClose(_hostWav, _soundRate);
         base.OnExiting(sender, args);
     }
 
@@ -1211,5 +1225,18 @@ internal sealed class TurokGame : Game
         }
         _pictureMessage = "debug capture saved to " + dir;
         _pictureMessageUntil = Environment.TickCount64 + 4000;
+    }
+
+    // Prepend a WAV header to the raw 16-bit stereo recorded in TUROK_HOST_WAV.
+    private static void WriteWavHeaderAndClose(FileStream fs, int rate)
+    {
+        var raw = new byte[fs.Length];
+        fs.Position = 0;
+        fs.ReadExactly(raw);
+        fs.Position = 0;
+        using var bw = new BinaryWriter(fs);
+        bw.Write("RIFF"u8); bw.Write(36 + raw.Length); bw.Write("WAVE"u8);
+        bw.Write("fmt "u8); bw.Write(16); bw.Write((short)1); bw.Write((short)2); bw.Write(rate); bw.Write(rate * 4); bw.Write((short)4); bw.Write((short)16);
+        bw.Write("data"u8); bw.Write(raw.Length); bw.Write(raw);
     }
 }

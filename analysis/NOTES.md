@@ -367,3 +367,15 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - An OS `SetWindowPos` resize to 1484x521 mid-game.
   - A 4:3 window toggled to fullscreen on a 2560x1440 monitor (EFB 854).
   - `--4x3` (EFB 640), the title, menus, FMV, the level-1 intro cutscene and Dark Jungle.
+
+### Vanishing close-up bushes: the real cause
+- `draw()` (gx_render.c) silently dropped any primitive with more than 4096 vertices. GX allows 65535.
+- Level 1's detailed foliage includes a 4745-vertex triangle strip. The simple far model is small, so objects were visible far away and vanished up close.
+- Now drawn. The per-worker transformed-vertex buffer was also 4096 entries; it is now 65536, because the first attempt overflowed it and corrupted the heap (exit 0xC0000374).
+- The fade/visibility leads were all genuine game features, not bugs: the F2 opacity, the F3 light alpha, the script Visible on/off flag (actor +0x1A, fn_80087D38), and particle partdef visible near/far.
+
+## Audio: buzz when the game stalls
+- Host-side diagnostics added: `TUROK_HOST_WAV=<path>` records exactly what goes to the sound device, and host_stats.txt lists trims and starvation with frame numbers. On a 2-minute menu-to-level run the host had no trims and no starvation.
+- The distortion was in the core's AI DMA. During a level load the guest didn't refill the next AX buffer in time, and the AI kept replaying the latched 5 ms buffer: a 200 Hz buzz with a DC offset, 0.4 s long at 31 s into the run. Water areas are heavy enough to cause the same thing.
+- Fix: a buffer bit-identical to the previous one fades from the last sample to silence instead of repeating. Re-recorded: 118 repeated 5 ms blocks became 0, and click spikes went from 201 to 58 (the rest are normal transients).
+- Note: under Git Bash, `timeout` may resolve to Windows timeout.exe, and exit codes can be misreported (127). Launch test runs from PowerShell (`Start-Process -Wait -PassThru`).

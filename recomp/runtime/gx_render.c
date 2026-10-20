@@ -723,8 +723,9 @@ static int s_workers = -1;
 volatile uint64_t g_xf_tsc;            // time spent transforming, all threads ([stats])
 
 static void run_job(Job *j) {
-    static __declspec(thread) CoreVertex *t_buf;  // transformed vertices of one draw (up to 4096)
-    if (!t_buf) t_buf = malloc(sizeof(CoreVertex) * 4096);
+    // Transformed vertices of one draw: up to 65535 (GX's 16-bit vertex count).
+    static __declspec(thread) CoreVertex *t_buf;
+    if (!t_buf) t_buf = malloc(sizeof(CoreVertex) * 65536);
     uint64_t t0 = __rdtsc();
     for (uint32_t k = 0; k < j->n; k++) {
         const DrawJob *d = &j->d[k];
@@ -882,7 +883,10 @@ void gx_draw(uint8_t op, uint32_t count, const uint8_t *data) {
 
 static void draw(uint8_t op, uint32_t count, const uint8_t *data) {
     int prim = (op >> 3) & 7, vat = op & 7;
-    if (count == 0 || count > 4096) return;
+    if (count == 0) return;
+    // Large primitives (the GX limit is 65535 vertices) used to be dropped above 4096,
+    // which made detailed models (close-up foliage LODs) vanish.
+    if (count > 4096) { static int once; if (!once) { once = 1; logf_("[gx] large primitive: %u vertices", count); } }
     RawVtx *raw = arena_alloc(sizeof(RawVtx) * count);
     const uint8_t *start = data;
     vtx_format_setup(vat);

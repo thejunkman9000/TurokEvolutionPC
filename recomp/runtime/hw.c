@@ -220,11 +220,42 @@ static void aid_latch(void) {
     g_irq_pending = 1;
 }
 
+// A stalled game (long loads) doesn't refill the next buffer in time, and replaying
+// the stale one turns it into a loud buzz. When a buffer comes round bit-identical to
+// the one just played, fade from the last sample to silence instead.
+static uint64_t s_aid_last_hash;
+static int16_t s_aid_last_l, s_aid_last_r;
+static uint8_t s_aid_fade[0x8000 * 32 / 0x400];  // scratch, big-endian R,L pairs
+
+static uint64_t aid_hash(const uint8_t *p, uint32_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
 static void aid_update(void) {
     if (!s_aid_playing) return;
     if (host_time_ticks() < s_aid_deadline) return;
-    if (s_aid_len && s_aid_addr + s_aid_len <= RAM_SIZE)
-        audio_push_be_stereo(g_ram + s_aid_addr, s_aid_len, ai_dsp_sample_rate());
+    if (s_aid_len && s_aid_addr + s_aid_len <= RAM_SIZE) {
+        const uint8_t *pcm = g_ram + s_aid_addr;
+        uint64_t h = aid_hash(pcm, s_aid_len);
+        uint32_t frames = s_aid_len / 4;
+        if (h == s_aid_last_hash && frames && s_aid_len <= sizeof s_aid_fade) {
+            for (uint32_t i = 0; i < frames; i++) {  // linear fade from the last sample
+                float k = 1.0f - (float)(i + 1) / frames;
+                int16_t r = (int16_t)(s_aid_last_r * k), l = (int16_t)(s_aid_last_l * k);
+                uint8_t *f = s_aid_fade + 4 * i;
+                f[0] = (uint8_t)(r >> 8); f[1] = (uint8_t)r; f[2] = (uint8_t)(l >> 8); f[3] = (uint8_t)l;
+            }
+            s_aid_last_l = s_aid_last_r = 0;
+            audio_push_be_stereo(s_aid_fade, s_aid_len, ai_dsp_sample_rate());
+        } else {
+            audio_push_be_stereo(pcm, s_aid_len, ai_dsp_sample_rate());
+            const uint8_t *f = pcm + s_aid_len - 4;
+            s_aid_last_r = (int16_t)(f[0] << 8 | f[1]); s_aid_last_l = (int16_t)(f[2] << 8 | f[3]);
+        }
+        s_aid_last_hash = h;
+    }
     aid_latch();
 }
 
