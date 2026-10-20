@@ -379,3 +379,14 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
 - The distortion was in the core's AI DMA. During a level load the guest didn't refill the next AX buffer in time, and the AI kept replaying the latched 5 ms buffer: a 200 Hz buzz with a DC offset, 0.4 s long at 31 s into the run. Water areas are heavy enough to cause the same thing.
 - Fix: a buffer bit-identical to the previous one fades from the last sample to silence instead of repeating. Re-recorded: 118 repeated 5 ms blocks became 0, and click spikes went from 201 to 58 (the rest are normal transients).
 - Note: under Git Bash, `timeout` may resolve to Windows timeout.exe, and exit codes can be misreported (127). Launch test runs from PowerShell (`Start-Process -Wait -PassThru`).
+
+## No culling (default)
+- User report: bushes vanish when the camera moves slightly, and outside the 4:3 area at wide aspect ratios.
+- The widescreen fix only widened the plane/ray builders. Other tests read the camera cotangents (+0x108/+0x10C) directly at 4:3:
+  - `fn_8000F5A0` (point) and `fn_8000F750` / `fn_800103F8` (sphere, radius f1), which return 1 when visible. Found by scanning for functions that read both offsets.
+  - `fn_800101F0`, the box test: camera inside the box, else `fn_8000F8E8`. It is called by `fn_801024BC` about 400 times a frame in level 1 and rejects up to half (`TUROK_CULLSTATS=1` logs counts).
+- `hle_frustum.c` now wraps all four. They are widened like the builders, and with `TUROK_NOCULL=1` they always report visible.
+- No-cull also widens the scene cone/planes 3x horizontally and vertically.
+- The host sets TUROK_NOCULL=1 unless `--cull` is given.
+- Level 1 check: draws go from ~4500 to ~4850 per frame, the frame rate is unchanged at 60, and there are no errors.
+- Not verified at the user's pond spot.

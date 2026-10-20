@@ -44,3 +44,7 @@ VIWaitForRetrace
 # Widescreen: horizontal frustum culling widened to the host's EFB aspect: runtime/hle_frustum.c.
 8000EB88  # camera culling planes
 8000F2A4  # camera view-cone corner rays
+8000F5A0  # point visibility test (widened; TUROK_NOCULL)
+8000F750  # sphere visibility test
+800103F8  # sphere visibility test
+800101F0  # box visibility test

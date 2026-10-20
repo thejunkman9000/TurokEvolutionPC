@@ -19,9 +19,11 @@ internal static class Program
         //                    [--show-intro]    (play the logos and intro movie; skipped by default)
         //                    [--original-textures] (hardware texture filtering: no anisotropic/trilinear upgrade
         //                                       or distant alpha-test coverage boost)
+        //                    [--cull]          (keep the game's object culling; by default everything near
+        //                                       the view is drawn, so nothing pops in or out)
         string? iso = null;
         var opt = new TurokGame.Options();
-        bool showIntro = false;
+        bool showIntro = false, cull = false;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i].ToLowerInvariant())
@@ -32,6 +34,7 @@ internal static class Program
             case "--4x3": opt = opt with { Aspect = TurokGame.AspectMode.Original4x3 }; break;
             case "--invert-look": opt = opt with { InvertLook = true }; break;
             case "--show-intro": showIntro = true; break;
+            case "--cull": cull = true; break;
             case "--original-textures": TurokGame.s_enhanceTextures = false; break;
             case "--speed" when i + 1 < args.Length && float.TryParse(args[i + 1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var sp):
                 opt = opt with { Speed = sp }; i++; break;
@@ -47,6 +50,10 @@ internal static class Program
         // An explicit TUROK_SKIP_INTRO (e.g. 0 for scripted test runs) wins.
         if (Environment.GetEnvironmentVariable("TUROK_SKIP_INTRO") == null)
             Environment.SetEnvironmentVariable("TUROK_SKIP_INTRO", showIntro ? "0" : "frontendbackground");
+        // No-cull: the core makes the game's per-object visibility tests pass and widens its
+        // scene cone (recomp/runtime/hle_frustum.c). An explicit TUROK_NOCULL wins.
+        if (Environment.GetEnvironmentVariable("TUROK_NOCULL") == null)
+            Environment.SetEnvironmentVariable("TUROK_NOCULL", cull ? "0" : "1");
         iso ??= FindIso();
         if (iso == null || !File.Exists(iso))
         {

@@ -88,6 +88,10 @@ Texture enhancements (on by default, `--original-textures` for the hardware look
 - Alpha-tested foliage keeps its coverage at a distance: distant palm fronds and leaves no longer thin out or pop
   between mip levels.
 
+No culling (on by default, `--cull` for the original behaviour): the game's per-object visibility tests
+always pass and its scene view cone is widened, so objects near the screen edges or at wide aspect ratios no
+longer pop out. It costs roughly 10% more draws, which a PC doesn't notice.
+
 Smoothness: the game runs at 60 fps. On a 60 Hz display its frames are paced by the display's refresh. On faster
 displays (120/144 Hz) mouse look still turns at the full refresh rate: each refresh redraws the latest game frame
 rotated by any mouse motion the game hasn't caught up with yet (only the world; the weapon and HUD stay put).
