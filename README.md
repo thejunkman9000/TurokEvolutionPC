@@ -85,8 +85,8 @@ tuned for CRT TVs.
 
 Texture enhancements (on by default, `--original-textures` for the hardware look):
 - 8x anisotropic and trilinear filtering on mipmapped textures.
-- Alpha-tested foliage keeps its coverage at a distance: distant palm fronds and leaves no longer thin out or pop
-  between mip levels.
+- Alpha-tested foliage keeps the same coverage at every distance: distant palm fronds and leaves no longer thin out,
+  and bushes don't look denser far away than up close.
 
 No culling (on by default, `--cull` for the original behaviour): the game's per-object visibility tests
 always pass and its scene view cone is widened, so objects near the screen edges or at wide aspect ratios no

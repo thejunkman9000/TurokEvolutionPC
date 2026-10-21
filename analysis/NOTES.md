@@ -391,7 +391,7 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
 - Level 1 check: draws go from ~4500 to ~4850 per frame, the frame rate is unchanged at 60, and there are no errors.
 - Not verified at the user's pond spot.
 
-## Pond bushes vanishing up close (open)
+## Pond bushes vanishing up close (solved)
 - User's F4 pair (far/near, 107 frames apart): the bush batch (texture with the flowering bush) loses every instance closer than ~17 units; farther ones still draw. The vertex alpha is 255 and the konst is 1.
 - Bush TEV: alpha = texA x c0.a, tested >= 244. Stages 1-2 pass APREV and write REG2, so channel 1 never reaches alpha.
 - The light-7 spot (fn_8010747C: GXInitLightSpot 89.5 flat, GXInitLightDir(M x (0,-1,0)), DistAttn ref 6 / 0.025 steep) feeds only colour channel 1. My lighting matches Dolphin's formulas.
@@ -402,3 +402,9 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - F4 captures now print `player: x,y,z,yaw,pitch` (view actor +0x34/+0x38/+0x3C, +0xF0, +0x41C).
   - `TUROK_TELEPORT=<game frame>:x,y,z[,yaw,pitch]` puts the player there.
   - `TUROK_POSLOG=1` logs the position every 60 game frames.
+- **Cause: my texture enhancement, not the game.**
+  - Repro via `TUROK_TELEPORT` at the user's F4 position: all 1716 bush vertices are drawn up close.
+  - The flowering-bush texture is a sparse cut-out (28% opaque, alpha only 0/255). Up close it really is twiggy.
+  - The old shader boost (alpha x (1 + 0.3 x mip level) before the test) made distant bushes far denser than the art. Walking up, the boost faded out and the bushes thinned to their real look: an apparent reverse fade. The game samples them with linear mag and a -2.5 LOD bias.
+- **Fix:** `GetTexture` now gives each smaller mip level of a cut-out texture binary alpha, split at the value that keeps level 0's opaque fraction (`PreserveCoverage`). Coverage is equal at every distance and for any test threshold. The shader boost and its `Enhance` uniform are gone. `--original-textures` skips it.
+- F4 captures also print each draw's raw stage-0 sampler mode (`mode0`).

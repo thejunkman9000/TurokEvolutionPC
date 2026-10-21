@@ -119,6 +119,7 @@ internal sealed class TurokGame : Game
         public int Material;
         public readonly Texture2D?[] Textures = new Texture2D?[8];
         public readonly SamplerState[] Samplers = new SamplerState[8];
+        public readonly uint[] SamplerModes = new uint[8];  // raw TX_SETMODE0 (debug captures)
         public Rectangle Viewport, Scissor;
         public readonly uint[] TextureIds = new uint[8];
         public uint Kind, CopyId, CopyMode, ClearColor;
@@ -626,6 +627,7 @@ internal sealed class TurokGame : Game
                     b.Textures[t] = cb->Textures[t] >= 0 ? textures[cb->Textures[t]] : null;
                     b.TextureIds[t] = cb->Textures[t] >= 0 ? f->Textures[cb->Textures[t]].Id : 0;
                     b.Samplers[t] = Sampler(cb->Sampler[t]);
+                    b.SamplerModes[t] = cb->Sampler[t];
                 }
                 bool perspective = m[15] == 0f;
                 b.Perspective = perspective;
@@ -788,6 +790,7 @@ internal sealed class TurokGame : Game
         uint* src = t->Rgba;
         uint[]? prev = null;
         int pw = 0, ph = 0;
+        double coverage = -1;  // cut-out textures: fraction of opaque texels in level 0
         for (int l = 0; l < tex.LevelCount; l++)
         {
             int lw = Math.Max(1, w >> l), lh = Math.Max(1, h >> l);
@@ -799,11 +802,47 @@ internal sealed class TurokGame : Game
                 src += level.Length;
             }
             else level = BoxDownsample(prev!, pw, ph, lw, lh);  // levels the game didn't supply
-            tex.SetData(l, null, level, 0, level.Length);
+            uint[] upload = level;
+            if (s_enhanceTextures && tex.LevelCount > 1)
+            {
+                if (l == 0) coverage = CutoutCoverage(level);
+                else if (coverage > 0) upload = PreserveCoverage(level, coverage);
+            }
+            tex.SetData(l, null, upload, 0, upload.Length);
             prev = level; pw = lw; ph = lh;
         }
         _textures[t->Id] = (tex, _framesReceived);
         return tex;
+    }
+
+    // Alpha-tested cut-outs (foliage, fences) lose coverage in their smaller mip levels:
+    // thin shapes average below the test threshold and thin out or vanish with distance.
+    // For a cut-out (level-0 alpha only 0 or 255, with both present), each smaller level
+    // gets binary alpha again, split at the alpha value that keeps the same fraction of
+    // opaque texels as level 0. Coverage then matches at every distance and for any test
+    // threshold, so foliage neither thins out far away nor looks denser there than up close.
+    private static double CutoutCoverage(uint[] px)
+    {
+        int opaque = 0;
+        foreach (uint c in px)
+        {
+            uint a = c >> 24;
+            if (a == 255) opaque++;
+            else if (a != 0) return -1;
+        }
+        return opaque > 0 && opaque < px.Length ? (double)opaque / px.Length : -1;
+    }
+
+    private static uint[] PreserveCoverage(uint[] px, double coverage)
+    {
+        Span<int> hist = stackalloc int[256];
+        foreach (uint c in px) hist[(int)(c >> 24)]++;
+        int want = (int)Math.Round(coverage * px.Length), n = 0, cut = 255;
+        for (; cut > 1; cut--) { n += hist[cut]; if (n >= want) break; }
+        var o = new uint[px.Length];
+        for (int i = 0; i < px.Length; i++)
+            o[i] = (px[i] & 0x00FFFFFFu) | ((px[i] >> 24) >= (uint)cut ? 0xFF000000u : 0u);
+        return o;
     }
 
     private static uint[] BoxDownsample(uint[] src, int sw, int sh, int dw, int dh)
@@ -1101,7 +1140,6 @@ internal sealed class TurokGame : Game
             P["Stage"].SetValue(m.Stage); P["Swap"].SetValue(m.Swap); P["Konst"].SetValue(m.Konst);
             P["SwapTable"].SetValue(m.SwapTable); P["Regs"].SetValue(m.Regs); P["MapCoord"].SetValue(m.MapCoord);
             P["AlphaTest"].SetValue(m.AlphaTest);
-            P["Enhance"].SetValue(new Vector4(s_enhanceTextures ? 0.3f : 0f, 0, 0, 0));
             P["Fog"].SetValue(m.Fog); P["FogMode"].SetValue(m.FogMode); P["FogColor"].SetValue(m.FogColor);
             P["IndMisc"].SetValue(m.IndMisc);
             if (m.IndMisc.Y != 0)
@@ -1236,7 +1274,7 @@ internal sealed class TurokGame : Game
             var bl = m.Blend;
             bw.WriteLine($"{i} verts {b.Count} z {zmin:F1}..{zmax:F1} c0.a {a0min}-{a0max} c1.a {a1min}-{a1max} maps [{string.Join(",", b.TextureIds)}] " +
                          $"stages {m.Misc.Y} alphaTest {m.AlphaTest} blend {bl.ColorSourceBlend}/{bl.ColorDestinationBlend} " +
-                         $"alphaIn0 {m.AlphaIn[0]} alphaOp0 {m.AlphaOp[0]} stage0 {m.Stage[0]} konst0 {m.Konst[0]} depth {m.Depth.DepthBufferEnable}/{m.Depth.DepthBufferWriteEnable}");
+                         $"alphaIn0 {m.AlphaIn[0]} alphaOp0 {m.AlphaOp[0]} stage0 {m.Stage[0]} konst0 {m.Konst[0]} depth {m.Depth.DepthBufferEnable}/{m.Depth.DepthBufferWriteEnable} mode0 {b.SamplerModes[0]:X} (mag {((b.SamplerModes[0] & 16) != 0 ? "lin" : "near")}, min {(b.SamplerModes[0] >> 5) & 7})");
         }
         _pictureMessage = "debug capture saved to " + dir;
         _pictureMessageUntil = Environment.TickCount64 + 4000;
