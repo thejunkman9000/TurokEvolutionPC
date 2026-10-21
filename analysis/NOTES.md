@@ -408,3 +408,8 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - The old shader boost (alpha x (1 + 0.3 x mip level) before the test) made distant bushes far denser than the art. Walking up, the boost faded out and the bushes thinned to their real look: an apparent reverse fade. The game samples them with linear mag and a -2.5 LOD bias.
 - **Fix:** `GetTexture` now gives each smaller mip level of a cut-out texture binary alpha, split at the value that keeps level 0's opaque fraction (`PreserveCoverage`). Coverage is equal at every distance and for any test threshold. The shader boost and its `Enhance` uniform are gone. `--original-textures` skips it.
 - F4 captures also print each draw's raw stage-0 sampler mode (`mode0`).
+- **Follow-up (brightness line):** the game's own mips average in the transparent texels' black.
+  - Once those edges are made opaque, distant bushes darken, so crossing into the full-size texture looked like a jump to bright.
+  - Cut-out mip levels are now rebuilt from the level above with alpha-weighted colour (`AlphaWeightedDownsample`), then cut with `PreserveCoverage`.
+- The 240x240 EFB copy (copied at x=107 when widened) is the player's blob-shadow map, almost all black. Bush TEV stage 2 is colour x (1 - shadow x light-7 alpha), so it isn't the cause.
+- F4 captures now also save every EFB copy as `efbcopy_<id>.png`.

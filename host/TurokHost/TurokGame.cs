@@ -806,7 +806,14 @@ internal sealed class TurokGame : Game
             if (s_enhanceTextures && tex.LevelCount > 1)
             {
                 if (l == 0) coverage = CutoutCoverage(level);
-                else if (coverage > 0) upload = PreserveCoverage(level, coverage);
+                else if (coverage > 0)
+                {
+                    // Rebuild from the level above, averaging colour over opaque texels only:
+                    // the game's own mips average in the transparent texels' black, which
+                    // darkens distant foliage once its edges are made opaque.
+                    level = AlphaWeightedDownsample(prev!, pw, ph, lw, lh);
+                    upload = PreserveCoverage(level, coverage);
+                }
             }
             tex.SetData(l, null, upload, 0, upload.Length);
             prev = level; pw = lw; ph = lh;
@@ -831,6 +838,30 @@ internal sealed class TurokGame : Game
             else if (a != 0) return -1;
         }
         return opaque > 0 && opaque < px.Length ? (double)opaque / px.Length : -1;
+    }
+
+    // Box filter (each destination texel averages its 1-2 x 1-2 source block) with colour
+    // weighted by alpha, so transparent texels don't bleed their colour in.
+    private static uint[] AlphaWeightedDownsample(uint[] src, int sw, int sh, int dw, int dh)
+    {
+        var o = new uint[dw * dh];
+        int fx = sw / dw, fy = sh / dh;
+        for (int y = 0; y < dh; y++)
+            for (int x = 0; x < dw; x++)
+            {
+                long r = 0, g = 0, b = 0, a = 0; int n = 0;
+                for (int j = 0; j < fy; j++)
+                    for (int i = 0; i < fx; i++)
+                    {
+                        uint c = src[(y * fy + j) * sw + x * fx + i];
+                        uint ca = c >> 24;
+                        r += (c & 0xFF) * ca; g += ((c >> 8) & 0xFF) * ca; b += ((c >> 16) & 0xFF) * ca; a += ca; n++;
+                    }
+                uint oa = (uint)(a / n);
+                uint or = a > 0 ? (uint)(r / a) : 0, og = a > 0 ? (uint)(g / a) : 0, ob = a > 0 ? (uint)(b / a) : 0;
+                o[y * dw + x] = oa << 24 | ob << 16 | og << 8 | or;
+            }
+        return o;
     }
 
     private static uint[] PreserveCoverage(uint[] px, double coverage)
@@ -1255,6 +1286,8 @@ internal sealed class TurokGame : Game
         foreach (var (id, e) in _textures)
             if (e.LastUsed == _framesReceived)
                 using (var fs = File.Create(Path.Combine(dir, $"tex_{id:D5}.png"))) e.Tex.SaveAsPng(fs, e.Tex.Width, e.Tex.Height);
+        foreach (var (id, rt) in _efbCopies)
+            using (var fs = File.Create(Path.Combine(dir, $"efbcopy_{id:X8}.png"))) rt.SaveAsPng(fs, rt.Width, rt.Height);
         using var bw = new StreamWriter(Path.Combine(dir, "draws.txt"));
         bw.WriteLine($"frame {_framesReceived}; alpha lighting {(_alphaLightOff ? "off" : "on")}");
         bw.WriteLine(PlayerPlace());
