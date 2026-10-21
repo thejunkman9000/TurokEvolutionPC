@@ -19,6 +19,9 @@ internal sealed class TurokGame : Game
     // vertical FOV, more horizontally); everything else (HUD, 2D, shadow pass) stays 4:3,
     // centered. See "Dynamic widescreen" in analysis/NOTES.md.
     private const int MaxEfbWidth = 1706;  // 32:9
+    private const float ScopeP22 = 1.4f;            // world projection scale above this = scoped (normal 1.217)
+    private const float ScopeSensitivity = 1f / 3f; // mouse look scale while scoped
+    private bool _scoped;
     private readonly AspectMode _aspectMode;
     // TUROK_NARROW_CULL=1 keeps the game's 4:3 frustum culling (to compare).
     private readonly bool _narrowCulling = Environment.GetEnvironmentVariable("TUROK_NARROW_CULL") == "1";
@@ -435,7 +438,9 @@ internal sealed class TurokGame : Game
             {
                 if (dx != 0 || dy != 0)
                 {
-                    float yaw = -dx * _mouseRadPerPixel, pitch = -dy * _mouseRadPerPixel;
+                    // Scoped (zoomed) view: a third of the normal sensitivity.
+                    float k = _scoped ? ScopeSensitivity : 1f;
+                    float yaw = -dx * _mouseRadPerPixel * k, pitch = -dy * _mouseRadPerPixel * k;
                     Core.MouseLook(yaw, pitch);
                     _sentYaw += yaw; _sentPitch += pitch;
                 }
@@ -577,6 +582,7 @@ internal sealed class TurokGame : Game
     {
         CoreFrame* f = Core.AcquireFrame();
         if (f == null) { if (_framesReceived > 0) _framesRepeated++; return; }
+        float worldP22 = 0;  // vertical projection scale of the 3D world (zoom)
         try
         {
             if (f->Serial == _lastSerial) { _framesRepeated++; return; }
@@ -636,6 +642,7 @@ internal sealed class TurokGame : Game
                 // World draws only: the first-person weapon is drawn in view space right in
                 // front of the camera (|z| < 0.6) and must stay attached to it.
                 b.Reproject = perspective && cb->Viewport[2] >= 600 && cb->Viewport[3] >= 400;
+                if (b.Reproject) worldP22 = Math.Max(worldP22, MathF.Abs(m[5]));
                 if (b.Reproject)
                 {
                     float far = 0;
@@ -656,6 +663,16 @@ internal sealed class TurokGame : Game
         finally
         {
             Core.ReleaseFrame();
+        }
+        // Scope / zoom: the world's vertical projection scale is about 1.22 normally and at
+        // larger through a scope (anything past 1.4, a 1.15x zoom, counts). Frames without
+        // world draws keep the last state.
+        if (worldP22 > 0)
+        {
+            bool scoped = worldP22 > ScopeP22;
+            if (scoped != _scoped && Environment.GetEnvironmentVariable("TUROK_SCOPELOG") != null)
+                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "scope.log"), $"[scope] {(scoped ? "on" : "off")} (P22 {worldP22:F3}) frame {_framesReceived}{Environment.NewLine}");
+            _scoped = scoped;
         }
         RemapBatches();
         PurgeTextures();
@@ -1321,7 +1338,7 @@ internal sealed class TurokGame : Game
             using (var fs = File.Create(Path.Combine(dir, $"efbcopy_{id:X8}.png"))) rt.SaveAsPng(fs, rt.Width, rt.Height);
         using var bw = new StreamWriter(Path.Combine(dir, "draws.txt"));
         bw.WriteLine($"frame {_framesReceived}; alpha lighting {(_alphaLightOff ? "off" : "on")}");
-        bw.WriteLine(PlayerPlace());
+        bw.WriteLine(PlayerPlace() + (_scoped ? "; scoped" : ""));
         for (int i = 0; i < _batches.Count; i++)
         {
             var b = _batches[i];

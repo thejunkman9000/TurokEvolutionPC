@@ -70,6 +70,8 @@ Click in the window to capture the mouse; the mouse turns the view directly, lik
 | Debug: toggle light-driven alpha fades | F3 | |
 | Debug: save a capture of this frame (`captures\`) | F4 | |
 
+While zoomed through a scope, mouse look runs at a third of its normal speed.
+
 The modern layout applies while you control the player; in menus and cutscenes the buttons pass
 straight through (A/B/X/Y = A/B/X/Y). The game ships with *Invert Look* on, so the controller's right
 stick is flipped to make up look up; `--invert-look` keeps the game's inverted behaviour (or turn
