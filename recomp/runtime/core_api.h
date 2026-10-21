@@ -155,3 +155,4 @@ CORE_API float core_get_speed(void);  // effective speed, including the intro sk
 // Widescreen: the host draws the world `widen` (EFB width / 640) times wider than 4:3;
 // the game's horizontal frustum culling is widened to match (1 = original).
 CORE_API void core_set_aspect(float widen);
+CORE_API int core_in_menu(void);  // 1 while a front-end menu screen is loaded (host pillarboxes it)

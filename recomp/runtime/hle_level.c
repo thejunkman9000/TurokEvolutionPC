@@ -11,6 +11,7 @@
 #include "ppc.h"
 #include "host.h"
 #include "hw.h"
+#include "core_api.h"
 #include "../generated/funcs.h"
 
 #define LEVEL_PATH_ADDR 0x80001800u  // low-memory area left free by the OS (Gecko codes live here)
@@ -27,9 +28,26 @@ static void read_guest_str(uint32_t a, char *out, size_t n) {
     out[i] = 0;
 }
 
+// Front-end menu state for the host (menus were drawn for 4:3 and stay pillarboxed):
+// set when a front-end screen loads, cleared when a gameplay level loads. In-game
+// overlays ("ingame...": pause, options, save) and screens shown from either place
+// (confirmation, text input, controller prompt) leave it unchanged.
+static volatile int s_in_menu = 1;
+CORE_API int core_in_menu(void) { return s_in_menu; }
+static void track_menu(const char *path) {
+    const char *scr = strstr(path, "screens\\");
+    if (!strstr(path, "levels\\")) return;
+    if (!scr) { s_in_menu = 0; return; }
+    scr += 8;
+    if (!strncmp(scr, "ingame", 6) || !strncmp(scr, "confirmation", 12) || !strncmp(scr, "textinput", 9) ||
+        !strncmp(scr, "reconnectcontroller", 19)) return;
+    s_in_menu = 1;
+}
+
 void fn_80019700(PPCContext *c) {
     char path[260];
     read_guest_str(c->r[4], path, sizeof path);
+    track_menu(path);
     // Intro skip (TUROK_SKIP_INTRO=<screen>): the boot sequence (logos, legal, intro movie)
     // is replaced by a later front-end screen.
     char skip_buf[64];

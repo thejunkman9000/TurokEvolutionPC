@@ -33,7 +33,8 @@ host\TurokHost\bin\Release\net9.0-windows\TurokEvolution.exe "D:\Games\Turok - E
 
 Options: `--fullscreen`, `--scale 1..4` (internal resolution, multiples of 640x480; default 2), `--no-vsync`.
 The 3D view takes the window's shape (4:3 up to 32:9) and follows it live as the window is resized or goes
-fullscreen; the HUD, menus and movies stay 4:3, centered. `--4x3` keeps the original 4:3 picture and
+fullscreen, including the underwater view and the damage flash; the HUD and movies stay 4:3, centered, and the
+front-end menus are shown 4:3 with black side bars. `--4x3` keeps the original 4:3 picture and
 `--widescreen` fixes the view at 16:9 whatever the window. If the `.iso` sits next to the executable (or a few folders above it) the path can be omitted.
 
 Level select: `--level data/levels/<pod>/<name>/<name>.atr` makes **New Game** start that level instead of the

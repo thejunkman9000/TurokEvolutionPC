@@ -130,7 +130,7 @@ internal sealed class TurokGame : Game
         // As the core sent them (640x480 EFB space); RemapBatches turns them into the fields
         // above for the current EFB width, again whenever the window changes shape.
         public Matrix GuestProjection;
-        public bool Perspective, FullQuad;
+        public bool Perspective, FullQuad, EdgeOverlay;
         public readonly int[] GuestViewport = new int[4], GuestScissor = new int[4], GuestCopySrc = new int[4];
     }
 
@@ -632,6 +632,7 @@ internal sealed class TurokGame : Game
                 bool perspective = m[15] == 0f;
                 b.Perspective = perspective;
                 b.FullQuad = !perspective && cb->Kind == 0 && IsFullScreenQuad(f, cb, b.GuestProjection);
+                b.EdgeOverlay = !perspective && cb->Kind == 0 && IsEdgeOverlay(f, cb, b.GuestProjection);
                 // World draws only: the first-person weapon is drawn in view space right in
                 // front of the camera (|z| < 0.6) and must stay attached to it.
                 b.Reproject = perspective && cb->Viewport[2] >= 600 && cb->Viewport[3] >= 400;
@@ -647,7 +648,7 @@ internal sealed class TurokGame : Game
                     float zmin = float.MaxValue, zmax = float.MinValue;
                     for (int v = 0; v < cb->VertexCount; v++) { float z = f->Vertices[cb->FirstVertex + v].Position.Z; zmin = Math.Min(zmin, z); zmax = Math.Max(zmax, z); }
                     _batchInfo ??= new System.Text.StringBuilder();
-                    _batchInfo.AppendLine($"{i} kind {cb->Kind} n {cb->VertexCount} persp {perspective} P11 {m[0]:F3} P22 {m[5]:F3} P33 {m[10]:F5} P34 {m[11]:F3} vp {cb->Viewport[0]},{cb->Viewport[1]},{cb->Viewport[2]},{cb->Viewport[3]} z {zmin:F2}..{zmax:F2} fullquad {b.FullQuad} tex [{string.Join(",", b.TextureIds)}] copies [{string.Join(",", b.CopyRefs)}] mat {cb->Material}" +
+                    _batchInfo.AppendLine($"{i} kind {cb->Kind} n {cb->VertexCount} persp {perspective} P11 {m[0]:F3} P22 {m[5]:F3} P33 {m[10]:F5} P34 {m[11]:F3} vp {cb->Viewport[0]},{cb->Viewport[1]},{cb->Viewport[2]},{cb->Viewport[3]} z {zmin:F2}..{zmax:F2} ndc {(perspective ? "-" : NdcBounds(f, cb, b.GuestProjection).ToString())} fullquad {b.FullQuad} tex [{string.Join(",", b.TextureIds)}] copies [{string.Join(",", b.CopyRefs)}] mat {cb->Material}" +
                                           (cb->Kind == 1 ? $" copy id {cb->CopyId} src {cb->CopySrc[0]},{cb->CopySrc[1]},{cb->CopySrc[2]},{cb->CopySrc[3]} mode {cb->CopyMode:X}" : ""));
                 }
             }
@@ -660,12 +661,26 @@ internal sealed class TurokGame : Game
         PurgeTextures();
     }
 
-    // An orthographic draw of a few vertices spanning the whole 640-wide screen: a fade,
-    // flash or tint over the 3D view, or a cutscene's letterbox bar, stretched across the
-    // wide EFB so the sides get it too.
+    // An orthographic draw spanning the whole 640-wide screen: a fade, flash or tint over
+    // the 3D view, a cutscene's letterbox bar, or the underwater wobble (a warped grid that
+    // redraws a copy of the frame). RemapBatches stretches it across the wide EFB when it
+    // only samples fills or full-width EFB copies.
+    // Screen extent of a batch in normalized device coordinates (x0, x1, y0, y1).
+    private static unsafe (float X0, float X1, float Y0, float Y1) NdcBounds(CoreFrame* f, CoreBatch* cb, Matrix proj)
+    {
+        float x0 = float.MaxValue, x1 = float.MinValue, y0 = float.MaxValue, y1 = float.MinValue;
+        TevVertex* v = f->Vertices + cb->FirstVertex;
+        for (int i = 0; i < cb->VertexCount; i++)
+        {
+            var p = Vector4.Transform(new Vector4(v[i].Position, 1), proj);
+            x0 = Math.Min(x0, p.X); x1 = Math.Max(x1, p.X); y0 = Math.Min(y0, p.Y); y1 = Math.Max(y1, p.Y);
+        }
+        return (x0, x1, y0, y1);
+    }
+
     private static unsafe bool IsFullScreenQuad(CoreFrame* f, CoreBatch* cb, Matrix proj)
     {
-        if (cb->VertexCount == 0 || cb->VertexCount > 12 || cb->Viewport[0] > 16 || cb->Viewport[2] < 600 || cb->Viewport[3] < 400)
+        if (cb->VertexCount == 0 || cb->VertexCount > 4096 || cb->Viewport[0] > 16 || cb->Viewport[2] < 600 || cb->Viewport[3] < 400)
             return false;
         float x0 = float.MaxValue, x1 = float.MinValue, y0 = float.MaxValue, y1 = float.MinValue;
         TevVertex* v = f->Vertices + cb->FirstVertex;
@@ -675,6 +690,19 @@ internal sealed class TurokGame : Game
             x0 = Math.Min(x0, p.X); x1 = Math.Max(x1, p.X); y0 = Math.Min(y0, p.Y); y1 = Math.Max(y1, p.Y);
         }
         return x0 <= -0.98f && x1 >= 0.98f && y1 - y0 > 0.02f;
+    }
+
+    // A large overlay piece anchored to one side of the screen: e.g. the damage vignette,
+    // drawn as four quadrant quads with red gradient textures. At least half the screen
+    // wide and tall and touching the left or the right edge, but not both (full-screen
+    // images such as movies span both and stay 4:3). Stretched with the wide view.
+    private static unsafe bool IsEdgeOverlay(CoreFrame* f, CoreBatch* cb, Matrix proj)
+    {
+        if (cb->VertexCount == 0 || cb->VertexCount > 12 || cb->Viewport[0] > 16 || cb->Viewport[2] < 600 || cb->Viewport[3] < 400)
+            return false;
+        var (x0, x1, y0, y1) = NdcBounds(f, cb, proj);
+        bool left = x0 <= -0.98f, right = x1 >= 0.98f;
+        return left != right && x1 - x0 >= 0.9f && y1 - y0 >= 0.9f;
     }
 
     // Guest (640-wide) batch rectangles and projections -> the current EFB.
@@ -691,7 +719,7 @@ internal sealed class TurokGame : Game
             // fills (untextured, or a tiny texture such as the 8x8 black of the cutscene bars)
             // and ones sampling a full-width EFB copy (which is itself wide); full-screen
             // images (menus, FMV) and the HUD stay 4:3.
-            bool stretch = !b.Perspective && b.FullQuad && IsFillOrWideCopy(b);
+            bool stretch = !b.Perspective && (b.FullQuad && IsFillOrWideCopy(b) || b.EdgeOverlay);
             bool widen = _centerOff != 0 && fullView && (b.Perspective || stretch);
             b.Projection = b.GuestProjection;
             if (widen && b.Perspective)
@@ -740,6 +768,9 @@ internal sealed class TurokGame : Game
         if (_aspectMode == AspectMode.Wide16x9) width = 854;
         else if (_aspectMode == AspectMode.Window && pp.BackBufferWidth > 0 && pp.BackBufferHeight > 0)
             width = Math.Clamp((int)MathF.Round(EfbHeight * pp.BackBufferWidth / (float)pp.BackBufferHeight / 2) * 2, 640, MaxEfbWidth);
+        // Front-end menus were laid out for 4:3 (their 3D backdrops clip at the sides):
+        // a 640-wide EFB, which the presenter pillarboxes.
+        if (Core.InMenu() != 0) width = 640;
         if (_target != null && width == EfbWidth) return;
         EfbWidth = width;
         _wideFactor = EfbWidth / 640f;
@@ -1232,7 +1263,7 @@ internal sealed class TurokGame : Game
                              $"mtx {m.IndMtx[0]} {m.IndMtx[1]} size {m.CoordSize[0]} copies [{string.Join(",", b.CopyRefs)}] vp {b.Viewport}" : ""));
             }
         }
-        if (Environment.GetEnvironmentVariable("TUROK_CAPTURE") == _framesReceived.ToString() && _captureFrame != _framesReceived) _captureNext = true;
+        if ((Environment.GetEnvironmentVariable("TUROK_CAPTURE") ?? "").Split(',').AsSpan().Contains(_framesReceived.ToString()) && _captureFrame != _framesReceived) _captureNext = true;
         if (_captureNext && _framesReceived != _captureFrame) { _captureNext = false; _captureFrame = _framesReceived; DebugCapture(); }
         if (_ramDumpFrames.Remove(_framesReceived)) DumpRam(_framesReceived);
         foreach (var p in _pokes) if (p.frame == _framesReceived) PokeAdd(p.addr, p.add);
@@ -1280,7 +1311,7 @@ internal sealed class TurokGame : Game
     // F4: everything needed to diagnose a rendering problem in one folder.
     private unsafe void DebugCapture()
     {
-        var dir = Path.Combine(AppContext.BaseDirectory, "captures", DateTime.Now.ToString("yyyy-MM-dd HHmmss"));
+        var dir = Path.Combine(AppContext.BaseDirectory, "captures", DateTime.Now.ToString("yyyy-MM-dd HHmmss") + $" f{_framesReceived}");
         Directory.CreateDirectory(dir);
         using (var fs = File.Create(Path.Combine(dir, "screen.png"))) _target!.SaveAsPng(fs, _target.Width, _target.Height);
         foreach (var (id, e) in _textures)
@@ -1307,7 +1338,7 @@ internal sealed class TurokGame : Game
             var bl = m.Blend;
             bw.WriteLine($"{i} verts {b.Count} z {zmin:F1}..{zmax:F1} c0.a {a0min}-{a0max} c1.a {a1min}-{a1max} maps [{string.Join(",", b.TextureIds)}] " +
                          $"stages {m.Misc.Y} alphaTest {m.AlphaTest} blend {bl.ColorSourceBlend}/{bl.ColorDestinationBlend} " +
-                         $"alphaIn0 {m.AlphaIn[0]} alphaOp0 {m.AlphaOp[0]} stage0 {m.Stage[0]} konst0 {m.Konst[0]} depth {m.Depth.DepthBufferEnable}/{m.Depth.DepthBufferWriteEnable} mode0 {b.SamplerModes[0]:X} (mag {((b.SamplerModes[0] & 16) != 0 ? "lin" : "near")}, min {(b.SamplerModes[0] >> 5) & 7})");
+                         $"alphaIn0 {m.AlphaIn[0]} alphaOp0 {m.AlphaOp[0]} stage0 {m.Stage[0]} konst0 {m.Konst[0]} depth {m.Depth.DepthBufferEnable}/{m.Depth.DepthBufferWriteEnable} vp {b.Viewport} fullquad {b.FullQuad} mode0 {b.SamplerModes[0]:X} (mag {((b.SamplerModes[0] & 16) != 0 ? "lin" : "near")}, min {(b.SamplerModes[0] >> 5) & 7})");
         }
         _pictureMessage = "debug capture saved to " + dir;
         _pictureMessageUntil = Environment.TickCount64 + 4000;

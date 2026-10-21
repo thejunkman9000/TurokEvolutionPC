@@ -413,3 +413,15 @@ Based on which functions touch GameCube hardware registers (`tools/hwclassify.py
   - Cut-out mip levels are now rebuilt from the level above with alpha-weighted colour (`AlphaWeightedDownsample`), then cut with `PreserveCoverage`.
 - The 240x240 EFB copy (copied at x=107 when widened) is the player's blob-shadow map, almost all black. Bush TEV stage 2 is colour x (1 - shadow x light-7 alpha), so it isn't the cause.
 - F4 captures now also save every EFB copy as `efbcopy_<id>.png`.
+
+## Widescreen follow-ups: menus, underwater, damage overlay
+- **Menus pillarboxed:** `core_in_menu()` (hle_level.c) is set when a `u_jcowlishaw\screens\` level loads and cleared by a gameplay level load.
+  - `ingame*` overlays (pause, options, save), confirmation, text input and the controller prompt leave it unchanged.
+  - While it is set the host uses a 640-wide EFB, which the presenter fits with black side bars, and culling isn't widened.
+- **Underwater:** the game copies the full frame (EFB copy 640x480) and redraws it through a 54-vertex warped grid, then tints it with a full-screen quad. `IsFullScreenQuad` used to stop at 12 vertices; it now allows up to 4096, still only for fills or full-width copies.
+- **Damage/death vignette:** four quadrant quads with red gradient textures and vertex alpha. `IsEdgeOverlay` stretches ortho quads that are at least half the screen in each direction and touch exactly one side edge. The HUD is small, and full-screen images touch both edges, so both stay 4:3.
+- **Repro:** drowning at `TUROK_TELEPORT=1100:-78,-24,-58` (the pond in level 1) shows both the underwater view and the red overlay.
+- **Debug additions:**
+  - `TUROK_CAPTURE` takes a comma list of frames, and capture folders include the frame number.
+  - draws.txt lists the viewport and full-screen flag.
+  - batchinfo lists ortho NDC bounds.

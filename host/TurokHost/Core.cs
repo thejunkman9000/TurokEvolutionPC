@@ -144,6 +144,9 @@ internal static unsafe partial class Core
     [LibraryImport(Dll, EntryPoint = "core_set_aspect")]
     public static partial void SetAspect(float widen);
 
+    [LibraryImport(Dll, EntryPoint = "core_in_menu")]
+    public static partial int InMenu();
+
     // True while mouse look applies (on-foot first-person control).
     [LibraryImport(Dll, EntryPoint = "core_first_person")]
     private static partial int FirstPersonRaw();
